@@ -270,8 +270,8 @@
    "path": "skills/t3-phone-answers/SKILL.md",
    "dest": "t3-phone-answers/SKILL.md",
    "kind": "skill",
-   "bytes": 11635,
-   "sha256": "2c825173dd47ad11f1504a02de484ef2b200c7e669f44b28a817e68abebd017f"
+   "bytes": 13663,
+   "sha256": "4497dbc2f3aaf6f0db621733d6114fa8b9ad0304c2f3e9915febb6441ce49848"
   },
   {
    "path": "skills/t3-pm-thread/SKILL.md",
@@ -333,8 +333,8 @@
    "path": "skills/t3-tots-rules/SKILL.md",
    "dest": "t3-tots-rules/SKILL.md",
    "kind": "skill",
-   "bytes": 24814,
-   "sha256": "6da8f7a6ab7c7e20ece08ef73f31a02b78f0b74115f45f63359f3a88fe97f35a"
+   "bytes": 25375,
+   "sha256": "1e30a74635a3597ad24bad4dbb127fde01006f975b7e285586950279d8719a37"
   },
   {
    "path": "skills/t3-update/SKILL.md",

@@ -63,6 +63,20 @@ Then ask the agent to set up T3 Tots. It follows [AGENTS.md](AGENTS.md) (hash-ch
 
 `t3listen` POSTs live T3 events to a webhook you set up (`setup`, then `install` at login). Events: `request.opened` / `request.resolved`, and `thread.finished` / `failed` / `cancelled`. Approvals only if you turn them on. Usage-limit stops can arm T3's Resume at reset.
 
+Events add `turnState` without changing their existing names. By default, `listen.json` watches `["final","waiting-user","failed","cancelled"]`: an idle orchestrator waiting for work no longer wakes the webhook on every turn. `turnHint` contains `runningSubtasks`, `queued`, `pending` counts and `waitingCommand` (a short redacted description, or null).
+
+| `turnState` | Meaning |
+|---|---|
+| `final` | Idle, with no pending request, actionable plan, queued run, running subtask or awaited background work. |
+| `waiting-subagents` | Idle while delegated child threads or in-thread subagents are still working, or a delegated result handoff is pending/claimed. |
+| `waiting-command` | Idle while a command/monitor is marked `awaited`, or a background task is pending. An unawaited server does not block final. |
+| `waiting-user` | A question, approval or actionable plan needs attention. Questions and approvals keep the `request.opened` path; request closures also carry this lifecycle label. |
+| `failed`, `cancelled` | The existing failure/cancellation events. Failures are still eligible even if a later run has started. |
+
+`node t3listen watch` prints only the selected states. `node t3listen watch final,waiting-user,failed,cancelled,waiting-subagents` opts into subagent waits; `node t3listen watch ''` explicitly disables all automatic webhook events. Unknown states or a non-array `watch` fail at startup with `BAD_LISTEN_CONFIG`. The setter preserves URL, headers and other settings without printing them. Restart the listener to apply changes (`install` again, keeping `--approvals` if previously installed with it). The explicit `test` command bypasses this filter.
+
+Queued messages, including a held queue, prevent a final notification. Filtered mid-job turns remain eligible for a later final, with deferred run IDs saved across restarts. The listener rereads the live shell before reporting and rechecks deferred parents on parent/child updates. Only the latest successful turn can be final; an earlier turn does not consume a follow-up turn's notification. Repeated run/state events are deduplicated for 14 days, with distinct `eventId`s for opt-in interim states. Webhook retries reuse the same ID, so receivers should deduplicate it too. `preview-finish` prints the classification even if the watch list filters it; it sends nothing.
+
 Setup, events, approvals, and autoresume: [t3-phone-answers](skills/t3-phone-answers/SKILL.md). Who may answer: [t3-tots-rules "Decisions"](skills/t3-tots-rules/SKILL.md).
 
 ## Delegated mode and approvals
