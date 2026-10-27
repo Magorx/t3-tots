@@ -24,13 +24,31 @@ const readJSON = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8"))
 // ---------- config ----------
 // minutes after which an old request is skipped at startup; missing or unreadable means the documented 1440 (a day), 0 turns it off
 const staleMinutes = (v) => (v === undefined || v === null || v === "" || !Number.isFinite(+v) || +v < 0 ? 1440 : +v);
+const TURN_STATES = ["final", "waiting-user", "failed", "cancelled", "waiting-subagents", "waiting-command"];
+const DEFAULT_WATCH = ["final", "waiting-user", "failed", "cancelled"];
+function watchList(v) {
+  if (v === undefined) return [...DEFAULT_WATCH];
+  if (!Array.isArray(v) || v.some((s) => !TURN_STATES.includes(s))) throw new Error(`BAD_LISTEN_CONFIG: watch must be an array containing only: ${TURN_STATES.join(", ")}`);
+  return [...new Set(v)];
+}
 function loadConfig() {
   const c = readJSON(CONF, null);
-  if (!c) { if (DRY) return { machine: os.hostname().replace(/\.local$/, ""), approvals: flag("--approvals"), skipStaleMinutes: staleMinutes(optv("--skip-stale")) };
+  if (!c) { if (DRY && !fs.existsSync(CONF)) return { machine: os.hostname().replace(/\.local$/, ""), approvals: flag("--approvals"), watch: watchList(), skipStaleMinutes: staleMinutes(optv("--skip-stale")) };
     die("NO_LISTEN_CONFIG", `no listen.json next to t3listen. Create it with: node "${path.join(DIR, "t3listen")}" setup  (or use --dry-run)`); }
   if (!DRY && !/^https:\/\//.test(c.url || "") && !/^http:\/\/(127\.0\.0\.1|localhost)[:/]/.test(c.url || "")) die("BAD_LISTEN_CONFIG", "listen.json url must start with https:// (http only for localhost)");
   return { url: c.url, headers: c.headers || {}, machine: c.machine || os.hostname().replace(/\.local$/, ""), approvals: c.approvals === true || flag("--approvals"),
-    skipStaleMinutes: staleMinutes(c.skipStaleMinutes) };
+    watch: watchList(c.watch), skipStaleMinutes: staleMinutes(c.skipStaleMinutes) };
+}
+function watch() { // change only the public selection; never print the URL or headers
+  const c = readJSON(CONF, null), value = argv[1] && argv[1].startsWith("--") ? undefined : argv[1];
+  if (value !== undefined) {
+    if (!c || typeof c !== "object" || Array.isArray(c)) die("NO_LISTEN_CONFIG", "run setup first; watch won't replace an unreadable listen.json");
+    const list = watchList(value === "" ? [] : value.split(",").map((s) => s.trim()));
+    if (!DRY) { const tmp = CONF + ".part"; fs.writeFileSync(tmp, JSON.stringify({ ...c, watch: list }, null, 1) + "\n", { mode: 0o600 }); fs.renameSync(tmp, CONF); lockDown(CONF); }
+    console.log(`${DRY ? "would watch" : "watch"}: ${list.join(",") || "(none)"}${DRY ? "" : " (restart the listener to apply)"}`); return;
+  }
+  if (!c && fs.existsSync(CONF)) die("BAD_LISTEN_CONFIG", "listen.json is unreadable; watch changed nothing");
+  console.log(`watch: ${watchList(c ? c.watch : undefined).join(",") || "(none)"}`);
 }
 function lockDown(f) {
   if (process.platform !== "win32") { fs.chmodSync(f, 0o600); return; }
@@ -109,7 +127,8 @@ function requestInfo(p, r) {
 function summary(e) {
   const where = `"${e.title}"${e.project ? ` (${e.project})` : ""} on ${e.machine}`;
   if (END_WORD[e.event]) { const d = e.durationSec, dur = d == null ? "" : ` after ${d >= 3600 ? `${Math.floor(d / 3600)}h ${Math.round((d % 3600) / 60)}m` : d >= 60 ? `${Math.round(d / 60)}m` : `${d}s`}`;
-    return `T3 ${e.delegated ? "sub-task " : ""}thread ${where} ${END_WORD[e.event]} at ${e.completedAtLocal}${dur}${e.error ? `\nError: ${e.error}` : ""}${e.usageLimit ? (e.autoResumeSet ? `\nUsage limit: auto-resume is set for ${e.resumeAtLocal || localTime(e.resumeAt)}.` : `\nUsage limit: not auto-resumed (${e.autoResumeNote || "unknown"}).`) : ""}${e.lastReply ? `\nLast reply: ${e.lastReply}` : ""}`; }
+    const word = MID_STATES.has(e.turnState) ? `is ${e.turnState}` : END_WORD[e.event];
+    return `T3 ${e.delegated ? "sub-task " : ""}thread ${where} ${word} at ${e.completedAtLocal}${dur}${e.error ? `\nError: ${e.error}` : ""}${e.usageLimit ? (e.autoResumeSet ? `\nUsage limit: auto-resume is set for ${e.resumeAtLocal || localTime(e.resumeAt)}.` : `\nUsage limit: not auto-resumed (${e.autoResumeNote || "unknown"}).`) : ""}${e.lastReply ? `\nLast reply: ${e.lastReply}` : ""}`; }
   if (e.event === "request.resolved") return `T3 ${e.kind === "user_input" ? "question" : "approval"} in ${where} is closed${e.answeredHere ? " (answered from chat)" : ""}: ${e.status}${e.answers ? " - " + Object.values(e.answers).map((v) => (Array.isArray(v) ? v.join(", ") : v)).join("; ") : e.decision ? " - " + e.decision : ""}`;
   if (e.questions) return `T3 question in ${where}:\n${e.context ? `Context: ${e.context}\n` : ""}` + e.questions.map((q) => `${q.question}${q.multiSelect ? " (pick one or more)" : ""}\n` + q.options.map((x, i) => `  ${i + 1}. ${x.label}`).join("\n") + (q.allowCustomAnswer ? "\n  (or type an answer)" : "")).join("\n");
   return `T3 approval in ${where}: ${e.approval.requestKind}${e.approval.prompt ? " - " + e.approval.prompt : ""}\n` + e.approval.options.map((x) => `  - ${x.label}`).join("\n");
@@ -136,13 +155,14 @@ async function post(e) { // one attempt; returns { ok, status, body, retry }
 }
 const ref = (e) => String(e.requestId || e.runId || "");
 function markDelivered(e) {
-  if (e.runId && !e.requestId) { const f = S.finished[e.runId]; if (f && f.e) { delete f.e; saveState(); } return; }
+  if (e.runId && !e.requestId) { const f = S.finished[e.runId]; if (f && f.e && f.e.turnState === e.turnState) { delete f.e; saveState(); } return; }
   const s = S.sent[e.requestId]; if (!s) return;
   if (e.event === "request.opened") s.delivered = true; else if (e.event === "request.resolved" && s.closing) delete S.sent[e.requestId];
   saveState();
 }
 async function deliver(e) {
-  cleanEvent(e); e.text = summary(e); e.sentAt = new Date().toISOString(); e.eventId = crypto.createHash("sha256").update(`${e.event}|${ref(e)}`).digest("hex").slice(0, 16);
+  if (!C.watch.includes(e.turnState || (e.requestId ? "waiting-user" : END_STATE[e.event] || "final"))) return true;
+  cleanEvent(e); e.text = summary(e); e.sentAt = new Date().toISOString(); e.eventId = crypto.createHash("sha256").update(`${e.event}|${ref(e)}${e.runId && MID_STATES.has(e.turnState) ? "|" + e.turnState : ""}`).digest("hex").slice(0, 16);
   if (DRY) { log("DRY-RUN payload " + JSON.stringify(e)); delivered++; return true; }
   for (let i = 0; i < 3; i++) {
     const r = await post(e);
@@ -167,7 +187,7 @@ setInterval(async () => {
 }, 60000).unref();
 
 // ---------- state: which requests the phone has been told about ----------
-let S = { sent: {}, finished: {} };
+let S = { sent: {}, finished: {}, deferred: {} };
 const saveState = () => { if (DRY) return; const t = STATE + ".part"; fs.writeFileSync(t, JSON.stringify(S)); fs.renameSync(t, STATE); };
 const known = new Map(); // threadId -> pendingRuntimeRequest.id last seen (null = none)
 const meta = { projects: new Map(), threads: new Map() };
@@ -183,7 +203,8 @@ async function reconcile(ep, threadId, opts = {}) {
     if (S.sent[r.id] && (S.sent[r.id].delivered !== false || !opts.startup)) continue;
     const ageMin = (Date.now() - Date.parse(r.createdAt)) / 60000;
     if (opts.startup && C.skipStaleMinutes > 0 && ageMin > C.skipStaleMinutes) { S.sent[r.id] = { threadId, skipped: true }; continue; }
-    const e = { event: "request.opened", ...base, ...requestInfo(p, r) };
+    if (!C.watch.includes("waiting-user")) continue;
+    const e = { event: "request.opened", ...base, ...requestInfo(p, r), ...turnDetails(t, p, [...meta.threads.values()]), turnState: "waiting-user" };
     if (e.questions && !e.questions.length) e.note = "question details not readable; answer it in T3";
     S.sent[r.id] = { threadId, at: (S.sent[r.id] && S.sent[r.id].at) || Date.now(), delivered: false }; saveState(); await deliver(e);
   }
@@ -191,19 +212,22 @@ async function reconcile(ep, threadId, opts = {}) {
     if (s.threadId !== threadId || open.some((r) => r.id === id)) continue;
     const r = all.find((x) => x.id === id);
     if (s.closing && !opts.startup) continue; // already queued for retry
-    if (!s.skipped && !(await deliver({ event: "request.resolved", ...base, requestId: id, kind: r ? r.kind : "user_input", status: opts.gone || (r ? r.status : "gone"), answeredHere: answeredHere(id),
+    if (!s.skipped && !(await deliver({ event: "request.resolved", ...base, ...turnDetails(t, p || {}, [...meta.threads.values()]), turnState: "waiting-user", requestId: id, kind: r ? r.kind : "user_input", status: opts.gone || (r ? r.status : "gone"), answeredHere: answeredHere(id),
       ...(r && r.answers ? { answers: r.answers } : {}), ...(r && r.decision ? { decision: r.decision } : {}), resolvedAt: (r && r.resolvedAt) || new Date().toISOString() }))) { s.closing = true; saveState(); continue; } // kept so a restart resends it
     delete S.sent[id]; saveState();
   }
 }
 
 // ---------- run ends: finished / failed / cancelled ----------
-// One event per run (keyed by run id in listen-state.json "finished", kept 14 days), so restarts never repeat one.
+// One event per run/state (keyed by run id in listen-state.json "finished", kept 14 days).
+// Filtered mid-job turns live in "deferred" and can still produce one final, including after a restart.
 // "finished"/"cancelled" only when the thread is left idle (a queued message starting next is not an end); "failed" always.
 // Sub-task threads (id "thread:delegated-task:...") are reported only when they fail.
-const DELEGATED = "thread:delegated-task:", ACTIVE = new Set(["running", "starting"]);
+const DELEGATED = "thread:delegated-task:", ACTIVE = new Set(["preparing", "running", "starting"]);
 const END = { completed: "thread.finished", failed: "thread.failed", error: "thread.failed", cancelled: "thread.cancelled", interrupted: "thread.cancelled" };
 const END_WORD = { "thread.finished": "finished", "thread.failed": "failed", "thread.cancelled": "was cancelled" };
+const END_STATE = { "thread.failed": "failed", "thread.cancelled": "cancelled" };
+const MID_STATES = new Set(["waiting-subagents", "waiting-command", "waiting-user"]);
 const runSeen = new Map(); // threadId -> { status, activeRunId } last seen
 // localTime: "Oct 21, 7:16 PM IST"; the default locale often names the zone only as GMT+5:30, so try a few English ones (same as t3ctl)
 const tzName = (d) => { let fb = "";
@@ -212,9 +236,33 @@ const tzName = (d) => { let fb = "";
   return fb; };
 const localTime = (iso) => { const d = new Date(iso); if (!iso || !Number.isFinite(d.getTime())) return iso;
   return `${d.toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })} ${tzName(d)}`.trim(); };
-const noteRun = (t) => { const prev = runSeen.get(t.id); runSeen.set(t.id, { status: t.status, activeRunId: t.activeRunId || null }); return prev; };
+const noteRun = (t) => { const prev = runSeen.get(t.id); runSeen.set(t.id, { status: t.status, activeRunId: t.activeRunId || null, latestRunId: t.latestRunId || null }); return prev; };
 const isActive = (t) => !!(t && (t.activeRunId || ACTIVE.has(t.status)));
 const isBusy = (t) => isActive(t) || (t && t.status === "queued"); // a queued message is about to start
+function turnDetails(t, p, threads, event) {
+  const pending = (p.runtimeRequests || []).filter((r) => r.status === "pending" && !SKIP_KINDS.has(r.kind)).length || (t.pendingRuntimeRequest ? 1 : 0);
+  const queued = (p.runs || []).filter((r) => r.status === "queued").length;
+  // Shell pendingBackgroundTasks is derived by T3 from the current provider and active turn items.
+  // awaited distinguishes a command wait from a server left running. limitRecovery.autoResume is unrelated.
+  const tasks = t.pendingBackgroundTasks || (p.providerThreads || []).filter((x) => !p.thread?.activeProviderThreadId || x.id === p.thread.activeProviderThreadId).flatMap((x) => x.pendingBackgroundTasks || []);
+  const holds = (x) => x.kind === "subagent" || x.kind === "background_task" || x.awaited === true;
+  const kids = threads.filter((x) => x.lineage && x.lineage.parentThreadId === t.id && (isBusy(x) || x.status === "waiting" || x.pendingRuntimeRequest || (x.pendingBackgroundTasks || []).some(holds)));
+  const subIds = new Set(kids.map((x) => x.id));
+  const subs = (p.subagents || []).filter((a) => ["running", "starting", "pending", "waiting"].includes(a.status));
+  for (const task of tasks) if (task.kind === "subagent") {
+    const a = subs.find((a) => a.id === task.taskId || a.nativeTaskRef?.nativeId === task.taskId);
+    subIds.add(task.childThreadId || a?.childThreadId || a?.id || task.taskId);
+  }
+  for (const a of subs) subIds.add(a.childThreadId || a.id);
+  // A child may have finished before T3 queues its result handoff to the parent.
+  const handoff = (p.subagents || []).some((a) => a.origin === "app_owned" && ["pending", "claimed"].includes(a.completionDelivery?.state)
+    && !["stopped", "disposed"].includes((p.runs || []).find((r) => r.id === a.runId)?.delegatedCompletion?.disposition));
+  const command = tasks.find((x) => (x.kind === "command" || x.kind === "monitor") && x.awaited === true);
+  const background = tasks.some((x) => x.kind === "background_task");
+  const turnHint = { runningSubtasks: subIds.size, queued, pending, waitingCommand: command && command.description ? trim(command.description, 120) : null };
+  const turnState = END_STATE[event] || (pending || t.hasActionableProposedPlan ? "waiting-user" : command || background ? "waiting-command" : subIds.size || handoff ? "waiting-subagents" : isBusy(t) || queued ? null : "final");
+  return { turnState, turnHint };
+}
 async function buildEnd(ep, t, runId, opts = {}) { // -> { e } or { skip: reason }
   let p = null;
   for (let i = 0; i < 3; i++) { // the projection can trail the shell update by a moment
@@ -228,9 +276,19 @@ async function buildEnd(ep, t, runId, opts = {}) { // -> { e } or { skip: reason
   if (!run) return { skip: "no run" };
   if (!run.startedAt) return { skip: "run never started (removed from the queue)" };
   const event = END[run.status] || (!isBusy(t) && END[t.status]); if (!event) return { skip: `run status ${run.status}` };
+  let sh;
+  try { const r = await fetch(`${ep.base}/api/orchestration/shell`, { headers: ep.H }); if (!r.ok) throw new Error(`HTTP ${r.status}`); sh = await r.json(); }
+  catch (err) { return { skip: `couldn't read shell: ${err.message}` }; }
+  t = (sh.threads || []).find((x) => x.id === t.id) || t; // projection/thread.updated may trail a new run
   const delegated = t.id.startsWith(DELEGATED);
   if (delegated && event !== "thread.failed") return { skip: "sub-task thread that didn't fail" };
   if (event !== "thread.failed" && isBusy(t) && !opts.preview) return { skip: "thread is going on with its next queued message" };
+  const details = turnDetails(t, p, sh.threads || [], event);
+  if (!details.turnState) return { skip: "thread is going on with its next queued message" };
+  if (event !== "thread.failed" && details.turnHint.queued && !opts.preview) return { skip: "thread is going on with its next queued message" };
+  // Catch-up must never relabel every historical completed run with today's final state.
+  const latest = (p.runs || []).filter((r) => r.startedAt).sort((a, b) => (a.ordinal || 0) - (b.ordinal || 0)).at(-1);
+  if (event !== "thread.failed" && ((t.latestRunId && t.latestRunId !== run.id) || (latest && latest.id !== run.id))) return { skip: "a newer run owns the thread" };
   if (opts.since && endedAt(run) < opts.since) return { skip: "ended before the listener's last run" };
   const items = p.turnItems || [], txt = (x) => x.text ?? x.content ?? (x.message && x.message.text);
   const said = items.filter((x) => x.type === "assistant_message" && typeof txt(x) === "string" && txt(x).trim());
@@ -239,7 +297,7 @@ async function buildEnd(ep, t, runId, opts = {}) { // -> { e } or { skip: reason
   const errText = errItem ? (txt(errItem) || errItem.message || errItem.title) : t.lastError ? (t.lastError.message || "error") : null;
   const done = run.completedAt || new Date().toISOString(), m = meta.threads.get(t.id) || {};
   const e = { event, kind: event.replace(".", "-"), machine: C.machine, threadId: t.id, title: t.title || m.title || t.id, project: meta.projects.get(t.projectId || m.projectId) || null,
-    delegated, runId: run.id, status: run.status, threadStatus: t.status || null, startedAt: run.startedAt, completedAt: done, completedAtLocal: localTime(done),
+    ...details, delegated, runId: run.id, status: run.status, threadStatus: t.status || null, startedAt: run.startedAt, completedAt: done, completedAtLocal: localTime(done),
     durationSec: run.startedAt ? Math.max(0, Math.round((Date.parse(done) - Date.parse(run.startedAt)) / 1000)) : null,
     lastReply: reply ? trim(txt(reply), 600) : null, ...(event === "thread.failed" && errText ? { error: trim(String(errText), 300) } : {}) };
   return { e, run };
@@ -325,7 +383,7 @@ async function armResume(ep, threadId, run) { // -> { usageLimit, autoResumeSet,
   } catch (err) { log(`usage limit in "${clean(t.title)}": couldn't arm resume-at-reset: ${err.message}`); return { ...fields, autoResumeSet: false, autoResumeNote: `arm failed: ${trim(err.message, 160)}` }; }
 }
 async function reportEnd(ep, t, runId, opts = {}) {
-  if (runId && S.finished[runId]) return;
+  if (runId && S.finished[runId] && !MID_STATES.has(S.finished[runId].turnState)) return;
   if (!runId && opts.since) { // catch-up: every ended run in the window, not only the newest
     let p = null;
     try { p = await threadSnap(ep, t.id); } catch (err) { if (VERBOSE) log(`run end in "${clean(t.title)}" not reported: couldn't read thread: ${err.message}`); return; }
@@ -336,19 +394,40 @@ async function reportEnd(ep, t, runId, opts = {}) {
   }
   const { e, skip, run } = await buildEnd(ep, t, runId, opts);
   if (!e) { if (VERBOSE) log(`run end in "${clean(t.title)}" not reported: ${skip}`); return; }
-  if (S.finished[e.runId]) return;
+  cleanEvent(e); // before any state save: never persist raw event text
+  const old = S.finished[e.runId];
+  if (MID_STATES.has(e.turnState)) S.deferred[t.id] = { runId: e.runId, at: Date.now() };
+  else delete S.deferred[t.id];
+  saveState();
+  if (e.turnState === "waiting-user" && e.turnHint.pending) return; // questions/approvals use request.opened
+  if (old && (!MID_STATES.has(old.turnState) || (old.states || [old.turnState]).includes(e.turnState))) return;
   if (e.event === "thread.failed" && !e.delegated) { const a = await armResume(ep, t.id, run); if (a) Object.assign(e, { usageLimit: true }, a); }
+  if (!C.watch.includes(e.turnState)) return; // a filtered mid-job turn must not consume its final notification
   cleanEvent(e); // before it is saved: listen-state.json never holds a raw title, project or reply
-  S.finished[e.runId] = { threadId: t.id, at: Date.now(), e }; saveState(); await deliver(e);
+  S.finished[e.runId] = { threadId: t.id, at: Date.now(), turnState: e.turnState, states: [...(old ? old.states || [old.turnState] : []), e.turnState], e }; saveState(); await deliver(e);
 }
 async function checkFinish(ep, t, prev) {
-  if (!prev || !isActive(prev)) return; // only a run that we saw running or starting
+  if (!prev) return;
+  if (!isActive(prev)) { // a short follow-up can start and finish between shell updates
+    if (t.latestRunId && t.latestRunId !== prev.latestRunId && !isBusy(t)) {
+      if (!t.id.startsWith(DELEGATED)) { S.deferred[t.id] = { runId: t.latestRunId, at: Date.now() }; saveState(); }
+      await reportEnd(ep, t, t.latestRunId, { live: true });
+    }
+    return;
+  }
   const now = t.activeRunId || null;
   if (prev.activeRunId && prev.activeRunId === now) return; // same run still going
   if (!prev.activeRunId && isBusy(t)) return; // still starting
+  if (!t.id.startsWith(DELEGATED) && prev.activeRunId) { S.deferred[t.id] = { runId: prev.activeRunId, at: Date.now() }; saveState(); }
   await reportEnd(ep, t, prev.activeRunId, { live: true });
 }
-function pruneFinished() { const cut = Date.now() - 14 * 864e5; for (const [k, v] of Object.entries(S.finished)) if (!v.at || v.at < cut) delete S.finished[k]; }
+async function checkDeferred(ep, t) {
+  const d = S.deferred[t.id];
+  if (!d || isBusy(t)) return;
+  if (t.latestRunId && t.latestRunId !== d.runId) { delete S.deferred[t.id]; saveState(); return; }
+  await reportEnd(ep, t, d.runId, { live: true });
+}
+function pruneFinished() { const cut = Date.now() - 14 * 864e5; for (const table of [S.finished, S.deferred]) for (const [k, v] of Object.entries(table)) if (!v.at || v.at < cut) delete table[k]; }
 // lastAlive is a connected-session watermark. Do not advance it while the socket is down, or catch-up
 // `since` shrinks to ~2 min and finishes from a longer outage are skipped.
 let listening = false, liveGen = 0;
@@ -392,13 +471,21 @@ async function onItem(ep, v, full, ctx = {}) {
     for (const p of v.snapshot.projects || []) meta.projects.set(p.id, p.title);
     if (!full) return; // later snapshots are project-metadata refreshes with no threads
     const live = new Set();
-    for (const t of v.snapshot.threads || []) { live.add(t.id); meta.threads.set(t.id, { title: t.title, projectId: t.projectId }); known.set(t.id, t.pendingRuntimeRequest ? t.pendingRuntimeRequest.id : null); }
+    meta.threads.clear();
+    for (const t of v.snapshot.threads || []) { live.add(t.id); meta.threads.set(t.id, t); known.set(t.id, t.pendingRuntimeRequest ? t.pendingRuntimeRequest.id : null); }
     const check = new Set([...v.snapshot.threads.filter((t) => t.pendingRuntimeRequest).map((t) => t.id), ...Object.values(S.sent).map((s) => s.threadId)]);
     for (const tid of check) await reconcile(ep, tid, { startup: true, ...(live.has(tid) ? {} : { gone: "archived-or-deleted" }) });
     for (const t of v.snapshot.threads || []) noteRun(t);
     if (!DRY) {
       pruneFinished();
-      for (const f of Object.values(S.finished)) if (f.e && Date.now() - f.at < 864e5) await deliver(f.e); // not delivered before the restart
+      for (const [runId, f] of Object.entries(S.finished)) if (f.e && Date.now() - f.at < 864e5) {
+        if (f.e.turnState) { await deliver(f.e); continue; } // not delivered before the restart
+        // Upgrade old retry payloads through live classification instead of sending an unlabelled mid-job finish.
+        const t = meta.threads.get(f.threadId);
+        delete S.finished[runId];
+        if (t) { S.deferred[t.id] = { runId, at: f.at }; await reportEnd(ep, t, runId, { live: true }); }
+        saveState();
+      }
       const since = S.lastAlive ? S.lastAlive - 120000 : 0; // first run with this feature: nothing to catch up on
       // idle finished threads have status like "idle", not completed/failed; buildEnd skips runs completed before since
       // look at busy threads too so a failed end from downtime is still reported (failed always fires)
@@ -407,19 +494,23 @@ async function onItem(ep, v, full, ctx = {}) {
       listening = next.listening;
       if (next.listening) { S.lastAlive = next.lastAlive; saveState(); }
     }
+    for (const t of v.snapshot.threads || []) await checkDeferred(ep, t);
     log(`watching ${live.size} threads (${[...runSeen.values()].filter(isActive).length} running); ${Object.values(S.sent).filter((s) => !s.skipped).length} open question(s) sent, ${Object.values(S.sent).filter((s) => s.skipped).length} older one(s) skipped; run ends on`);
   } else if (v.kind === "project.updated") meta.projects.set(v.project.id, v.project.title);
   else if (v.kind === "thread.updated") {
-    const t = v.thread; meta.threads.set(t.id, { title: t.title, projectId: t.projectId });
-    if (v.location === "archive") { if (Object.values(S.sent).some((s) => s.threadId === t.id)) await reconcile(ep, t.id, { gone: "archived" }); known.delete(t.id); runSeen.delete(t.id); return; }
+    const t = v.thread; meta.threads.set(t.id, t);
+    if (v.location === "archive") { if (Object.values(S.sent).some((s) => s.threadId === t.id)) await reconcile(ep, t.id, { gone: "archived" }); known.delete(t.id); runSeen.delete(t.id); meta.threads.delete(t.id); delete S.deferred[t.id]; saveState(); return; }
     const prevRun = noteRun(t);
     if (VERBOSE && prevRun && (prevRun.status !== t.status || prevRun.activeRunId !== (t.activeRunId || null))) log(`thread.updated "${clean(t.title)}" status ${prevRun.status} -> ${t.status}, run ${prevRun.activeRunId ? prevRun.activeRunId.slice(-12) : "-"} -> ${t.activeRunId ? t.activeRunId.slice(-12) : "-"}`);
     await checkFinish(ep, t, prevRun);
+    await checkDeferred(ep, t);
+    const parent = t.lineage && meta.threads.get(t.lineage.parentThreadId);
+    if (parent) await checkDeferred(ep, parent);
     const now = t.pendingRuntimeRequest ? t.pendingRuntimeRequest.id : null, before = known.has(t.id) ? known.get(t.id) : null; known.set(t.id, now);
     const tracked = Object.values(S.sent).filter((s) => s.threadId === t.id && !s.skipped).length;
     if (VERBOSE && (tracked || now !== before)) log(`thread.updated "${clean(t.title)}" pending ${before ? before.slice(-12) : "-"} -> ${now ? now.slice(-12) : "-"} (tracked ${tracked})`);
     if (now !== before || tracked > 1 || (tracked === 1 && !now)) await reconcile(ep, t.id);
-  } else if (v.kind === "thread.removed") { known.delete(v.threadId); runSeen.delete(v.threadId); if (Object.values(S.sent).some((s) => s.threadId === v.threadId)) await reconcile(ep, v.threadId, { gone: "deleted" }); }
+  } else if (v.kind === "thread.removed") { known.delete(v.threadId); runSeen.delete(v.threadId); meta.threads.delete(v.threadId); delete S.deferred[v.threadId]; saveState(); if (Object.values(S.sent).some((s) => s.threadId === v.threadId)) await reconcile(ep, v.threadId, { gone: "deleted" }); }
 }
 
 async function run() {
@@ -427,10 +518,10 @@ async function run() {
   if (!DRY) {
     const other = +(fs.existsSync(PID) && fs.readFileSync(PID, "utf8")); if (other && other !== process.pid) { try { process.kill(other, 0); die("ALREADY_RUNNING", `another t3listen is running (pid ${other})`); } catch (e) { if (e.code === "EPERM") die("ALREADY_RUNNING", `another t3listen is running (pid ${other})`); } }
     fs.writeFileSync(PID, String(process.pid)); process.on("exit", () => { try { if (+fs.readFileSync(PID, "utf8") === process.pid) fs.unlinkSync(PID); } catch {} });
-    S = readJSON(STATE, { sent: {} }); S.sent = S.sent || {}; S.finished = S.finished || {};
+    S = readJSON(STATE, { sent: {} }); S.sent = S.sent || {}; S.finished = S.finished || {}; S.deferred = S.deferred || {};
   }
   for (const s of ["SIGINT", "SIGTERM"]) process.on(s, () => process.exit(0));
-  log(`t3listen started${DRY ? " (dry run: payloads are printed, nothing is sent)" : ""}; machine "${C.machine}", approvals ${C.approvals ? "on" : "off"}`);
+  log(`t3listen started${DRY ? " (dry run: payloads are printed, nothing is sent)" : ""}; machine "${C.machine}", approvals ${C.approvals ? "on" : "off"}, watch ${C.watch.join(",") || "(none)"}`);
   if (ONCE) { const t0 = Date.now(), limit = (+(optv("--timeout")) || 600) * 1000; setInterval(() => { if (delivered > 0) process.exit(0); if (Date.now() - t0 > limit) { log("--once: nothing happened before the timeout"); process.exit(2); } }, 500); }
   let delay = 2000, warned = "";
   for (;;) {
@@ -569,7 +660,8 @@ function pickThread(all, q) {
 const USAGE = `t3listen [run] [--dry-run] [--once [--timeout s]] [--approvals] [--log] [--verbose]   follow T3 and POST question events to the webhook
 t3listen setup [--machine name]   read the webhook URL (line 1) and 'Name: value' header lines from stdin into listen.json (private)
 t3listen test [--dry-run]         send one test event to the webhook
+t3listen watch [final,waiting-user,failed,cancelled,waiting-subagents,waiting-command]   print or set states to POST (restart to apply; an empty string watches none)
 t3listen preview-finish --thread id|title   print the run-end event for a thread's latest ended run (sends nothing)
 t3listen install [--approvals] | uninstall | status   start at login (macOS LaunchAgent, Windows logon task, Linux systemd --user)`;
-if (require.main !== module) module.exports = { pickThread, idLike, systemdUnit, localTime, approvalsLine, staleMinutes, RED, clean, cleanEvent, summary, requestInfo, endedAt, tickLastAlive, catchUpThreads, afterSnapshotListen, usageLimitFields, shellReadyToArm, canArmResume };
-else ({ run, setup, test, "preview-finish": previewFinish, install: async () => install(), uninstall: async () => uninstall(), status: async () => status() }[cmd] || (async () => console.log(USAGE)))().catch((e) => { console.error("error:", e.message); process.exit(1); });
+if (require.main !== module) module.exports = { watchList, turnDetails, pickThread, idLike, systemdUnit, localTime, approvalsLine, staleMinutes, RED, clean, cleanEvent, summary, requestInfo, endedAt, tickLastAlive, catchUpThreads, afterSnapshotListen, usageLimitFields, shellReadyToArm, canArmResume };
+else ({ run, setup, watch: async () => watch(), test, "preview-finish": previewFinish, install: async () => install(), uninstall: async () => uninstall(), status: async () => status() }[cmd] || (async () => console.log(USAGE)))().catch((e) => { console.error("error:", e.message); process.exit(1); });
