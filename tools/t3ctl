@@ -84,13 +84,86 @@ function addOwnedGrok(id, o, by) {
   try { grokLocked((r) => groupGrok(r, id, owner, by)); console.log(`grok: in the Grok section (owner ${owner})`); }
   catch (err) { console.error(`${err.message}. Retry: t3ctl group --thread ${id} --owner ${owner}`); }
 }
+// The dialog is local-only; neither posting nor reading initializes the T3 API unless --thread needs resolving.
+function grokInboxPath(env = process.env, home = HOME) { return env.T3_CUSTOM_GROK_INBOX || path.join(path.dirname(grokPath({ ...env, T3_CUSTOM_GROK_FILE: "" }, home)), "grok-inbox"); }
+function grokInboxLocked(fn, dir = grokInboxPath()) {
+  fs.mkdirSync(dir, { recursive: true }); const lock = path.join(dir, ".lock"), t0 = Date.now(), nap = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) { try { fs.mkdirSync(lock); break; } catch (err) { if (err.code !== "EEXIST") throw err;
+    if (Date.now() - t0 >= 15000) throw new Error(`GROK_INBOX_LOCKED: Grok dialog stayed locked for 15s (remove ${lock} if no t3ctl command is running)`);
+    Atomics.wait(nap, 0, 0, 10 + Math.floor(Math.random() * 30)); } }
+  try { return fn(dir); } finally { try { fs.unlinkSync(path.join(dir, "messages.jsonl.part")); } catch {} try { fs.rmdirSync(lock); } catch {} }
+}
+const grokDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+function grokLines(file) { try { const s = fs.readFileSync(file, "utf8"); return s ? s.replace(/\n$/, "").split("\n") : []; } catch (err) { if (err.code === "ENOENT") return []; throw err; } }
+function grokMessage(line) { try { const m = JSON.parse(line); return grokObject(m) && typeof m.at === "string" && Number.isFinite(Date.parse(m.at)) ? m : null; } catch { return null; } }
+const GROK_MIME = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif",
+  ".mp4": "video/mp4", ".mov": "video/quicktime", ".m4v": "video/x-m4v", ".webm": "video/webm", ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav", ".ogg": "audio/ogg" };
+function grokAttachments(list) {
+  const files = String(list || "").split(",").filter(Boolean); if (files.length > 20) throw new Error("BAD_ATTACHMENT: at most 20 attachments");
+  const names = new Set(); return files.map((f) => {
+    const src = path.resolve(expandHome(f)); let st;
+    try { if (sensitivePath(src) || sensitiveName(path.basename(src))) throw new Error("sensitive name");
+      st = fs.lstatSync(src); if (!st.isFile() || st.size > 4 * 1024 ** 3 || sensitivePath(fs.realpathSync(src))) throw new Error("not a regular safe file of at most 4 GiB");
+    } catch { throw new Error(`BAD_ATTACHMENT: refused ${f}`); }
+    const base = path.basename(src).replace(/[^A-Za-z0-9._ ()+-]/g, "_").replace(/^\.+/, "").slice(0, 120) || "attachment";
+    let name = base, n = 1; const ext = path.extname(base).length < 60 ? path.extname(base) : "", stem = base.slice(0, base.length - ext.length);
+    while (names.has(name.toLowerCase())) { const suffix = `-${++n}`; name = stem.slice(0, 120 - ext.length - suffix.length) + suffix + ext; } names.add(name.toLowerCase());
+    const type = path.extname(src).toLowerCase(), mime = GROK_MIME[type] || "application/octet-stream", kind = mime.startsWith("image/") ? "image" : mime.startsWith("video/") ? "video" : mime.startsWith("audio/") ? "audio" : "file";
+    return { src, name, kind, mime, size: st.size };
+  });
+}
+function writeGrokPost(o, thread, dir = grokInboxPath()) {
+  const from = o.from === undefined ? process.env.T3_OWNER : o.from;
+  if (typeof from !== "string" || !/^[A-Za-z0-9 ._-]{1,40}$/.test(from) || !from.trim()) throw new Error("USAGE: --from <bot> (or T3_OWNER) is required: 1-40 characters [A-Za-z0-9 ._-]");
+  if (o.text !== undefined && o["text-file"] !== undefined) throw new Error("USAGE: use either --text or --text-file");
+  const text = o["text-file"] !== undefined ? decodeText(fs.readFileSync(expandHome(o["text-file"]))) : String(o.text || "");
+  if (text.length > 20000 || (o.title !== undefined && String(o.title).length > 200)) throw new Error("USAGE: text is limited to 20000 characters and title to 200");
+  const files = grokAttachments(o.attach); if (!text.trim() && !files.length) throw new Error("USAGE: --text, --text-file or at least one --attach file is required");
+  return grokInboxLocked(() => {
+    const now = new Date(), raw = grokLines(path.join(dir, "messages.jsonl")), ids = new Set(raw.map((line) => grokMessage(line)?.id));
+    const stamp = grokDate(now).replace(/-/g, "") + "T" + [now.getHours(), now.getMinutes(), now.getSeconds()].map((n) => String(n).padStart(2, "0")).join(""); let id;
+    do { id = stamp + "-" + crypto.randomBytes(3).toString("hex"); } while (ids.has(id) || fs.existsSync(path.join(dir, "media", id)));
+    const media = path.join(dir, "media", id), file = path.join(dir, "messages.jsonl"), tmp = file + ".part";
+    const message = { v: 1, id, at: now.toISOString(), from, ...(o.title !== undefined ? { title: String(o.title) } : {}), text, attachments: [], ...(thread ? { thread } : {}) };
+    try {
+      if (files.length) fs.mkdirSync(media, { recursive: true });
+      for (const { src, ...a } of files) { const dst = path.join(media, a.name);
+        try { fs.copyFileSync(src, dst, fs.constants.COPYFILE_FICLONE); fs.chmodSync(dst, 0o644); } catch { throw new Error(`BAD_ATTACHMENT: could not copy ${src}`); }
+        message.attachments.push({ name: a.name, file: `media/${id}/${a.name}`, kind: a.kind, mime: a.mime, size: a.size }); }
+      const keep = [], archive = new Map();
+      for (const line of raw) { const m = grokMessage(line), old = m && Date.parse(m.at) < now.getTime() - 86400000;
+        if (m && !old) { keep.push({ line, at: Date.parse(m.at) }); continue; }
+        const date = m ? grokDate(new Date(m.at)) : "unreadable"; if (!archive.has(date)) archive.set(date, []); archive.get(date).push({ line, at: m ? Date.parse(m.at) : 0 }); }
+      if (archive.size) fs.mkdirSync(path.join(dir, "archive"), { recursive: true });
+      for (const [date, lines] of archive) fs.appendFileSync(path.join(dir, "archive", date + ".jsonl"), lines.sort((a, b) => a.at - b.at).map((x) => x.line).join("\n") + "\n", { mode: 0o644 });
+      keep.push({ line: JSON.stringify(message), at: now.getTime() });
+      fs.writeFileSync(tmp, keep.sort((a, b) => a.at - b.at).map((x) => x.line).join("\n") + "\n", { mode: 0o644 }); fs.chmodSync(tmp, 0o644); fs.renameSync(tmp, file); return message;
+    } catch (err) { fs.rmSync(media, { recursive: true, force: true }); try { fs.rmdirSync(path.dirname(media)); } catch {} throw err; }
+  }, dir);
+}
+async function grokPost(o) {
+  let linked;
+  if (o.thread !== undefined) { let ready = false;
+    try { if (init(true)) { const t = await findThread(o.thread); linked = { id: t.id, title: t.title }; ready = true; } }
+    catch (err) { if (!/^T3_NOT_REACHABLE[: (]/.test(err.message)) throw err; }
+    if (!ready) { if (/^[A-Za-z0-9_:-]{8,}$/.test(o.thread)) linked = { id: o.thread }; else throw new Error("T3_NOT_REACHABLE: open T3 Code to resolve a thread title"); } }
+  const m = writeGrokPost(o, linked); console.log(o.json ? JSON.stringify(m) : `posted ${m.id} to the Grok dialog (${m.attachments.length} file(s))`);
+}
+function grokInbox(o, dir = grokInboxPath()) {
+  const days = o.days === undefined ? 1 : Number(o.days); if (!Number.isInteger(days) || days < 1) throw new Error("BAD_SETTING: --days must be a whole number of 1 or more");
+  let archives = []; try { archives = fs.readdirSync(path.join(dir, "archive")).filter((f) => f.endsWith(".jsonl")).map((f) => path.join(dir, "archive", f)); } catch {}
+  const rows = []; for (const file of [path.join(dir, "messages.jsonl"), ...archives]) { let lines = []; try { lines = grokLines(file); } catch {}
+    for (const line of lines) { const m = grokMessage(line); if (m && Date.parse(m.at) >= Date.now() - days * 86400000) rows.push(m); } }
+  rows.sort((a, b) => Date.parse(a.at) - Date.parse(b.at)); if (o.json) console.log(JSON.stringify(rows));
+  else for (const m of rows) console.log(`${localT(m.at)}  ${m.from || "?"}  ${m.title || String(m.text || "").split(/\r?\n/)[0]}  ${(Array.isArray(m.attachments) ? m.attachments : []).map((a) => a && a.name || "").join(", ")}`.trimEnd());
+}
 function args(a = process.argv.slice(3)) { const o = {}; for (let i = 0; i < a.length; i++) { if (a[i].startsWith("--")) { const eq = a[i].indexOf("=");
   if (eq > 2) { o[a[i].slice(2, eq)] = a[i].slice(eq + 1); continue; }
   const k = a[i].slice(2); const v = a[i + 1] !== undefined && !a[i + 1].startsWith("--") ? a[++i] : true; o[k] = v; } } return o; }
 // flags that always take a value; "--from --to dir" must not read as --from=true. Switches (including --no-grok) need no entry.
 const VALUE_FLAGS = new Set(["thread", "project", "prompt", "prompt-file", "model", "effort", "title", "mode", "attach", "timeout", "from", "to", "only", "text", "pick", "answers",
   "decision", "request", "query", "q", "limit", "last", "number", "repo", "state", "stall-min", "until", "every", "at", "days", "id", "subagent", "edit", "move", "before", "steer",
-  "run", "provider", "turn", "reason", "label", "chars", "runtime", "enable", "disable", "delete", "copy", "owner"]);
+  "run", "provider", "turn", "reason", "label", "chars", "runtime", "enable", "disable", "delete", "copy", "owner", "text-file"]);
 function missingValue(o, cmd) { // --cancel takes a run id only for queue; elsewhere it is a switch
   return Object.keys(o).find((k) => o[k] === true && (VALUE_FLAGS.has(k) || (k === "cancel" && cmd === "queue"))); }
 async function get(p) {
@@ -540,6 +613,8 @@ const main = async () => {
   const bare = missingValue(cmd === "skills" ? args(process.argv.slice(3)) : o, cmd);
   if (bare) die("USAGE", `--${bare} needs a value (use --${bare}=<value> for a value that starts with --). Run t3ctl with no arguments for usage.`);
   if (cmd === "skills") return skillsCmd(process.argv[3] && !process.argv[3].startsWith("--") ? process.argv[3] : "list", args(process.argv.slice(3)));
+  if (cmd === "grok-post") return grokPost(o);
+  if (cmd === "grok-inbox") return grokInbox(o);
   if (cmd === "grok") { let ts = []; try { if (init(true)) { const s = await shell(); ts = [...s.threads, ...(s.archivedThreads || [])]; } } catch {}
     const rows = grokRows(readGrok(), ownerOf(o), ts); if (o.json) console.log(JSON.stringify(rows)); else for (const r of rows) console.log(`${r.id}  bot=${r.bot || "?"}  settled=${r.settled === null ? "?" : r.settled}  ${r.title || "(unavailable)"}`); return; }
   if (CMDS.includes(cmd)) init();
@@ -710,7 +785,7 @@ const main = async () => {
     const tmp = `${sf}.${process.pid}.tmp`; fs.writeFileSync(tmp, JSON.stringify(st, null, 1)); fs.renameSync(tmp, sf);
     if (o.json) { if (out.length) console.log(JSON.stringify({ changes: out, threads: snaps.map(({ reply, ...x }) => x) })); return; }
     for (const e of out) console.log(`${e.kind}  "${e.title}"  ${e.text}`); }
-  else console.log("t3ctl projects | models | threads [--project p] [--main] [--limit n] | new --project p --prompt t [--model m --effort e] [--owner subscriber (or env T3_OWNER)] [--no-grok] [--wait [--timeout seconds]] | send --thread id|title --prompt t [--wait [--timeout seconds]] [--queue] | queue --thread t [--steer runId|all | --cancel runId|all] | read --thread id|title [--last N] | group --thread t [--owner X] | ungroup --thread t | grok [--owner X] [--json] | settle|unsettle --thread t [--owner X] [--force] | rename --thread t --title x | interrupt --thread t [--hold] | status --thread t [--json] | pending --thread t [--json] | answer --thread t [--request id] (--pick label | --text txt | --answers json | --decision accept|decline|... [--user-approved] [--redirect]) | diff --thread t | files --thread t [--last-turn] [--copy no] | limits [--json] | snooze --thread t --until +2h|HH:MM|ISO | unsnooze --thread t | queue --thread t (--resume | --edit runId --text x | --move runId [--before runId|end | --first]) | model --thread t [--model m] [--effort e] [--provider p] | search --query q [--limit n] | tasks [--upsert ... [--prompt-file f] | --enable id | --disable id | --run id | --delete id --yes] | prs --project p [--state open] | pr --thread t [--number n] [--all] | pr --project p --repo o/r --number n | fork --thread t [--run runId] [--title x] [--owner subscriber] [--no-grok] | stop --thread t | subtasks --thread t [--all] | subagent-stop --thread t --subagent id | resume-at-reset --thread t [--cancel] | snooze-until-reset --thread t [--cancel] | watch --thread a[,b] [--state file] [--stall-min 20] [--json] | new/send ... --attach img1.png,img2.jpg | new/send ... --prompt-file p.md | send ... --no-verify | skills [list] [--from dir] [--to dir] | skills install --to dir [--from dir] [--only a,b] [--dry-run] [--force]");
+  else console.log("t3ctl projects | models | threads [--project p] [--main] [--limit n] | new --project p --prompt t [--model m --effort e] [--owner subscriber (or env T3_OWNER)] [--no-grok] [--wait [--timeout seconds]] | send --thread id|title --prompt t [--wait [--timeout seconds]] [--queue] | queue --thread t [--steer runId|all | --cancel runId|all] | read --thread id|title [--last N] | group --thread t [--owner X] | ungroup --thread t | grok [--owner X] [--json] | grok-post --from bot (--text markdown | --text-file path) [--title x] [--attach a.mp4,b.png] [--thread id|title] [--json] | grok-inbox [--days 1] [--json] | settle|unsettle --thread t [--owner X] [--force] | rename --thread t --title x | interrupt --thread t [--hold] | status --thread t [--json] | pending --thread t [--json] | answer --thread t [--request id] (--pick label | --text txt | --answers json | --decision accept|decline|... [--user-approved] [--redirect]) | diff --thread t | files --thread t [--last-turn] [--copy no] | limits [--json] | snooze --thread t --until +2h|HH:MM|ISO | unsnooze --thread t | queue --thread t (--resume | --edit runId --text x | --move runId [--before runId|end | --first]) | model --thread t [--model m] [--effort e] [--provider p] | search --query q [--limit n] | tasks [--upsert ... [--prompt-file f] | --enable id | --disable id | --run id | --delete id --yes] | prs --project p [--state open] | pr --thread t [--number n] [--all] | pr --project p --repo o/r --number n | fork --thread t [--run runId] [--title x] [--owner subscriber] [--no-grok] | stop --thread t | subtasks --thread t [--all] | subagent-stop --thread t --subagent id | resume-at-reset --thread t [--cancel] | snooze-until-reset --thread t [--cancel] | watch --thread a[,b] [--state file] [--stall-min 20] [--json] | new/send ... --attach img1.png,img2.jpg | new/send ... --prompt-file p.md | send ... --no-verify | skills [list] [--from dir] [--to dir] | skills install --to dir [--from dir] [--only a,b] [--dry-run] [--force]");
 };
-if (require.main !== module) module.exports = { grokPath, emptyGrok, normGrok, readGrok, grokLocked, groupGrok, ungroupGrok, grokMember, grokGate, routingOwner, grokRows, ownerOf, claimOwner, skillHash, args, missingValue, pickThread, pickProject, outPath, sensitivePath, sensitiveName, SENSITIVE_NAME, isMainThread, limitLine, localT, tzName, isSettled, threadLine, decodeText, approvalAllowed, redirectText, deliveryOf, stallHint, watchSnap, watchDiff, pendingOf, requestInfo, parseWhen, parseEvery, buildAnswer, matchOption };
+if (require.main !== module) module.exports = { grokInboxPath, grokInboxLocked, writeGrokPost, grokInbox, grokPath, emptyGrok, normGrok, readGrok, grokLocked, groupGrok, ungroupGrok, grokMember, grokGate, routingOwner, grokRows, ownerOf, claimOwner, skillHash, args, missingValue, pickThread, pickProject, outPath, sensitivePath, sensitiveName, SENSITIVE_NAME, isMainThread, limitLine, localT, tzName, isSettled, threadLine, decodeText, approvalAllowed, redirectText, deliveryOf, stallHint, watchSnap, watchDiff, pendingOf, requestInfo, parseWhen, parseEvery, buildAnswer, matchOption };
 else main().catch((e) => { const m = String(e.message).match(/"message":"([^"]{3,300})"/); const msg = m && /^\[\{"_tag":"Fail"/.test(e.message) ? m[1] : e.message; console.error(/^[A-Z][A-Z0-9_]{3,}[: (]/.test(msg) ? msg : `error: ${msg}`); process.exit(1); });

@@ -22,6 +22,7 @@ Change nothing on the user's computers unless the user approved that exact chang
 | t3-save-learnings | `AGENTS.md` or `CLAUDE.md`, after a yes to the diff |
 | t3-cleanup | Only the items the user picked, after a confirm |
 | t3-getting-started, t3-install-tools | The tools folder, after the setup or update yes |
+| Any skill, any bot | A post to the Grok dialog (`t3ctl grok-post`, "Grok dialog" below). The user asked for these reports, so no per-post yes is needed |
 
 A saved sync list or update level is approval for a later "sync everything" or "update <level>" only for items already in that list, and only after this turn's diff is shown. Anything new still needs a yes.
 
@@ -120,6 +121,7 @@ Uses T3's local API and needs the token, except `skills`. Running it with no arg
 | Answer | `answer --thread t [--request id] (--pick label \| --text words \| --answers json \| --decision d [--user-approved \| --redirect])` |
 | Queue | `queue --thread t [--steer id\|all \| --cancel id\|all \| --resume \| --edit id --text x \| --move id (--before id\|end \| --first)]` |
 | Grok section | `grok [--owner b] [--json]`, `group --thread t [--owner b]`, `ungroup --thread t` |
+| Grok dialog | `grok-post --from b (--text t \| --text-file f) [--title x] [--attach a.mp4,b.png] [--thread t] [--json]`, `grok-inbox [--days 1] [--json]` |
 | Thread actions | `settle`, `unsettle` (Grok threads only, else `--force`), `rename --title x`, `interrupt [--hold]`, `stop`, `subagent-stop --subagent id`, `fork [--run id --title x]`, `model [--model m --effort e --provider p]`, `snooze --until +2h\|HH:MM\|ISO`, `unsnooze`, `resume-at-reset [--cancel]`, `snooze-until-reset [--cancel]` |
 | Scheduled tasks | `tasks [--upsert ... \| --enable id \| --disable id \| --run id \| --delete id --yes]` |
 | Skills | `skills [list] [--from dir] [--to dir]`, `skills install --to dir [--from dir] [--only a,b] [--dry-run] [--force]` (copies these skills into another agent's skills folder; see the repo README) |
@@ -169,6 +171,14 @@ The Custom T3 sidebar lists threads that bots start in a **Grok** section above 
   - `running-ok`: leave it.
 - A new turn after a review makes the thread unreviewed again. Never settle a running, waiting or unreviewed thread, another bot's thread, or a main-list thread.
 
+#### Grok dialog
+Custom T3 has a Grok dialog behind the X button in the sidebar footer: one everlasting conversation that bots post into, so the user sees local videos, images and files in T3 without anything being uploaded.
+- Post with `t3ctl grok-post --from <you> --text-file <note.md> [--title x] [--attach a.mp4,b.png] [--thread <id>]`. It runs on the computer that has the files and needs no token or running T3, only the files. Attachments are cloned into `<T3 home>/custom-t3/grok-inbox/media/` (instant on macOS, no extra space), so later edits or deletes of the source don't change the post.
+- Typical use: marketing renders a video, reports in the Grok app as usual, and posts the video here with one line on what it is and which thread made it (`--thread`). Post finished results and things the user should look at, not progress chatter.
+- The text is markdown (no HTML; links must be http(s)). Keep it short: what it is, what to check, and the next step.
+- `t3ctl grok-inbox [--days 1]` lists recent posts. The dialog shows the last day; older posts move to `archive/` and stay viewable with "Show earlier".
+- Never attach secrets: t3ctl refuses token, key, `.env` and credential files with `BAD_ATTACHMENT`.
+
 ### Other scripts and data files
 - `export.js` writes a redacted JSON export for reports. Options work like t3ctl (`--project Foo` or `--project=Foo`; an unknown option is `USAGE`). `--project` is a filter: an exact id, else a folder, else an exact title (case ignored) picks that project, and two exact matches stop with `AMBIGUOUS` listing them; otherwise every project whose title contains the words is exported, and it prints a note naming them. No `--project` means all. `survey.js` lists activity and stale threads.
 - `t3ui` and `ui-*.applescript` are a macOS-only UI fallback. They use the running T3 Code app, or `T3_APP`.
@@ -196,6 +206,8 @@ Scripts print these words. Relay them in plain words, not as errors. This is the
 | `NOT_FOUND` | No thread matches. List the closest ones and ask |
 | `NOT_GROK` | `t3ctl settle`/`unsettle` refused a main-list thread, which the user settles. Nothing was sent. Use `--force` only when the user asked for that exact thread |
 | `NOT_YOUR_THREAD` | That Grok thread belongs to another bot. Nothing was sent. Leave it to its owner |
+| `BAD_ATTACHMENT` | `t3ctl grok-post` refused an attachment (missing, not a file, over 4 GiB, or a sensitive name). Nothing was posted. Fix the path or leave it out |
+| `GROK_INBOX_LOCKED` | Another `grok-post` held the Grok dialog for 15 s. Nothing was posted. Retry |
 | `GROK_LOCKED`, `BAD_GROK_FILE` | The Grok list is locked by another t3ctl, or unreadable. Nothing changed. Retry, or tell the user |
 | `NOT_PENDING` | That question was already answered or closed |
 | `NOT_ANSWERABLE` | Its run ended, so it can't be answered. Offer a follow-up instead |

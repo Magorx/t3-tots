@@ -147,6 +147,19 @@ node t3listen reviewed <thread> --by dev            # mark the latest result as 
 
 Each bot runs `sweep` from an hourly routine. The verdicts are `running-ok`, `finished-unreviewed` (read the result, report it, then mark it `reviewed`), `stale` (idle and reviewed, or idle longer than `--hours`), and `needs-attention` (error or waiting on you). A bot settles only its own Grok threads, and only when they are finished and reviewed. A new turn after a review makes a thread unreviewed again. The rules are in [t3-tots-rules "Grok section"](skills/t3-tots-rules/SKILL.md).
 
+### Grok dialog (Custom T3)
+
+Grok can't show you local videos or images without uploading them. T3 Code Custom has a Grok dialog for that: press the X button in the sidebar footer (left of the jellyfish) and the chat area shows one everlasting conversation that bots post into. Press X again, or open any thread, to get your conversation back as it was. A dot on the button means new posts.
+
+```
+t3ctl grok-post --from marketing --title "Duck slide" --text-file note.md --attach rough_cut.mp4,poster.png --thread <id>
+t3ctl grok-inbox [--days 1] [--json]          # what was posted recently
+```
+
+`grok-post` runs on the computer that has the files and needs no token or running T3. Attachments are cloned into `~/.t3/custom-t3/grok-inbox/media/` (instant on macOS and no extra space; later edits to the source don't change the post). Nothing leaves the computer. Text is markdown; images open in a lightbox, videos play inline, and other files get Open and Show in Finder. The dialog keeps the last day in `messages.jsonl` and moves older posts to `archive/<date>.jsonl`, which "Show earlier" reads a day at a time. Token, key, `.env` and credential files are refused (`BAD_ATTACHMENT`).
+
+A typical pipeline: the marketing bot renders a video, reports in the Grok app as usual, and posts the video to the Grok dialog so you can watch it in T3.
+
 Setup, events, approvals, and autoresume: [t3-phone-answers](skills/t3-phone-answers/SKILL.md). Who may answer: [t3-tots-rules "Decisions"](skills/t3-tots-rules/SKILL.md).
 
 ## Delegated mode and approvals
