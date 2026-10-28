@@ -160,7 +160,7 @@ When `listen.json` has `subscribers` (`node t3listen subscribers`), every thread
 
 #### Grok section
 The Custom T3 sidebar lists threads that bots start in a **Grok** section above Saved. Bots settle the threads in it; the user settles everything in the main list.
-- Membership is in `<T3 home>/custom-t3/grok-shelf.json`, and only t3ctl writes it. `t3ctl new`/`fork --owner <you>` puts the new thread in Grok (`--no-grok` only when the user wants it in the main list). `t3ctl group --thread t [--owner b]` moves a thread in, `t3ctl ungroup --thread t` moves it out, and `t3ctl grok [--owner b]` lists the members. A `t3listen claim` changes routing only, never Grok.
+- Membership is in `<T3 home>/custom-t3/grok-shelf.json`, written by t3ctl and by the user dragging a thread in or out in the app (same lock). A thread the user dragged out is in `out`: don't `group` it again unless they ask. `t3ctl new`/`fork --owner <you>` puts the new thread in Grok (`--no-grok` only when the user wants it in the main list). `t3ctl group --thread t [--owner b]` moves a thread in, `t3ctl ungroup --thread t` moves it out, and `t3ctl grok [--owner b]` lists the members. A `t3listen claim` changes routing only, never Grok.
 - `t3ctl settle`/`unsettle` act only on Grok threads. A main-list thread stops with `NOT_GROK`; pass `--force` only when the user asked for that exact thread. With `--owner <you>` (or `T3_OWNER`), another bot's thread stops with `NOT_YOUR_THREAD`.
 - Hourly sweep: each bot runs `node t3listen sweep --owner <you> --json` from an hourly routine (read-only). Each of its Grok threads gets a verdict:
   - `needs-attention` (error, or waiting on the user): handle it under "Decisions", or tell the user.

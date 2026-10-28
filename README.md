@@ -133,7 +133,7 @@ To decide who owns a thread, look at its content. Game or engine code meant to b
 
 T3 Code Custom can show bot-started threads in a **Grok** section above Saved. That way your own list holds only the threads you started or want to keep. You settle main-list threads yourself. Each bot settles its own Grok threads once it has reviewed the result, and a settled Grok thread moves to Settled. Saved and pinned win: a Grok thread you save or pin stays where you put it.
 
-Membership is `<T3 home>/custom-t3/grok-shelf.json` (default `~/.t3/custom-t3/grok-shelf.json`), written only by t3ctl with a lock and an atomic rename. The app only reads it and picks up changes within a few seconds. A `t3listen claim` changes routing only, not Grok.
+Membership is `<T3 home>/custom-t3/grok-shelf.json` (default `~/.t3/custom-t3/grok-shelf.json`), written by t3ctl and by the app when you drag a thread in or out, both with the same lock and an atomic rename. Drag a thread between your list and Grok like Saved: a thread you drag out stays out (`out` in the file) until it is grouped again. The app picks up t3ctl's changes within a few seconds. A `t3listen claim` changes routing only, not Grok.
 
 ```
 t3ctl new --project P --prompt-file f --owner dev   # --owner also puts the thread in Grok (--no-grok keeps it in your list)

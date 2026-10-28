@@ -39,7 +39,7 @@ function claimOwner(id, o, by) {
   if (r.status === 0) { console.log(`owner: ${owner} (t3listen sends this thread's events only to ${owner})`); return true; }
   console.error(`owner not set (${String(r.stderr || r.stdout || r.error || "").trim().split("\n")[0].slice(0, 200)}). Retry: node t3listen claim ${id} ${owner}`); return false;
 }
-// Grok membership is independent of routing owners. Only this writer changes the shelf; readers tolerate damaged files.
+// Grok membership is independent of routing owners. This writer and the Custom T3 app (dragging a row in or out) change the shelf under the same lock; readers tolerate damaged files.
 function grokPath(env = process.env, home = HOME) {
   if (env.T3_CUSTOM_GROK_FILE) return env.T3_CUSTOM_GROK_FILE;
   let base = (env.T3CODE_HOME || "").trim(); if (base.startsWith("~")) base = path.join(home, base.slice(1));
