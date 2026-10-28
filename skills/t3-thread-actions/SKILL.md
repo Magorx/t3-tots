@@ -11,7 +11,7 @@ Follow the t3-tots-rules skill (skills/t3-tots-rules/SKILL.md). Find the thread 
 ## Actions
 | Action | Command |
 |---|---|
-| Settle or unsettle (reversible) | `t3ctl settle --thread '<t>'`, `t3ctl unsettle --thread '<t>'` |
+| Settle or unsettle (reversible) | `t3ctl settle --thread '<t>'`, `t3ctl unsettle --thread '<t>'`. These act only on Grok threads (t3-tots-rules "Grok section"). For a main-list thread the user asked about, add `--force` |
 | Rename | `t3ctl rename --thread '<t>' --title '<new>'` |
 | Stop the running turn | `t3ctl interrupt --thread '<t>'`; `--hold` also holds the queue |
 | Stop a run and its sub-tasks | `t3ctl stop --thread '<t>'`; this holds the queue |

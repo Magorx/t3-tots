@@ -129,6 +129,24 @@ t3ctl new --project P --prompt-file f --owner marketing   # or T3_OWNER=marketin
 
 To decide who owns a thread, look at its content. Game or engine code meant to be committed to main belongs to `dev`. Producing video, setting up a scene, posting and social work belong to `marketing`, which asks dev when it needs a new tool. Each bot claims the threads it starts (`--owner dev` / `--owner marketing`). Dev gets every unowned thread by default, and hands a thread to marketing with `claim` as soon as it sees the thread is marketing work.
 
+### Grok section (Custom T3 sidebar)
+
+T3 Code Custom can show bot-started threads in a **Grok** section above Saved. That way your own list holds only the threads you started or want to keep. You settle main-list threads yourself. Each bot settles its own Grok threads once it has reviewed the result, and a settled Grok thread moves to Settled. Saved and pinned win: a Grok thread you save or pin stays where you put it.
+
+Membership is `<T3 home>/custom-t3/grok-shelf.json` (default `~/.t3/custom-t3/grok-shelf.json`), written only by t3ctl with a lock and an atomic rename. The app only reads it and picks up changes within a few seconds. A `t3listen claim` changes routing only, not Grok.
+
+```
+t3ctl new --project P --prompt-file f --owner dev   # --owner also puts the thread in Grok (--no-grok keeps it in your list)
+t3ctl group --thread <t> [--owner dev]              # move a thread into Grok
+t3ctl ungroup --thread <t>                          # move it back to the main list
+t3ctl grok [--owner dev] [--json]                   # list Grok threads
+t3ctl settle --thread <t> --owner dev               # Grok threads only: a main-list thread stops with NOT_GROK (--force overrides)
+node t3listen sweep --owner dev [--hours 6] [--json]   # read-only status of dev's Grok threads, with a verdict each
+node t3listen reviewed <thread> --by dev            # mark the latest result as reviewed (--undo to clear)
+```
+
+Each bot runs `sweep` from an hourly routine. The verdicts are `running-ok`, `finished-unreviewed` (read the result, report it, then mark it `reviewed`), `stale` (idle and reviewed, or idle longer than `--hours`), and `needs-attention` (error or waiting on you). A bot settles only its own Grok threads, and only when they are finished and reviewed. A new turn after a review makes a thread unreviewed again. The rules are in [t3-tots-rules "Grok section"](skills/t3-tots-rules/SKILL.md).
+
 Setup, events, approvals, and autoresume: [t3-phone-answers](skills/t3-phone-answers/SKILL.md). Who may answer: [t3-tots-rules "Decisions"](skills/t3-tots-rules/SKILL.md).
 
 ## Delegated mode and approvals

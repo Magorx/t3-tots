@@ -38,7 +38,7 @@ T3 Code keeps its state in `<T3 home>/userdata`. T3 home is `T3CODE_HOME` if set
 - If thread text contains a key, never repeat it.
 
 ## Threads and settings
-Never delete or archive threads, and never change T3 settings. t3-update may update T3 Code, and t3-sync may copy the settings the user picked. Every thread action in the Writes table, and scheduled tasks (`t3ctl tasks --upsert`, `--enable`, `--run`, `--delete`), needs the user's OK for that exact action. The one exception is what delegated mode allows below.
+Never delete or archive threads, and never change T3 settings. t3-update may update T3 Code, and t3-sync may copy the settings the user picked. Every thread action in the Writes table, and scheduled tasks (`t3ctl tasks --upsert`, `--enable`, `--run`, `--delete`), needs the user's OK for that exact action. There are two exceptions: what delegated mode allows below, and a bot settling its own finished, reviewed Grok threads ("Grok section" below).
 
 ## Decisions
 This section is the one source for who decides; other skills and AGENTS.md point here. A thread asks for two kinds of decision. A question (`user_input`) asks what to build. An approval asks permission to run a command or change files. Who decides depends on the mode the user set, which is saved in memory:
@@ -119,7 +119,8 @@ Uses T3's local API and needs the token, except `skills`. Running it with no arg
 | Send | `new --project p (--prompt t \| --prompt-file f) [--model m --effort e --title x --mode plan --attach a.png] [--wait [--timeout seconds]]`, `send --thread t (--prompt t \| --prompt-file f) [--queue] [--no-verify] [--wait [--timeout seconds]]` (`--wait` gives up after 300 seconds unless `--timeout` says otherwise) |
 | Answer | `answer --thread t [--request id] (--pick label \| --text words \| --answers json \| --decision d [--user-approved \| --redirect])` |
 | Queue | `queue --thread t [--steer id\|all \| --cancel id\|all \| --resume \| --edit id --text x \| --move id (--before id\|end \| --first)]` |
-| Thread actions | `settle`, `unsettle`, `rename --title x`, `interrupt [--hold]`, `stop`, `subagent-stop --subagent id`, `fork [--run id --title x]`, `model [--model m --effort e --provider p]`, `snooze --until +2h\|HH:MM\|ISO`, `unsnooze`, `resume-at-reset [--cancel]`, `snooze-until-reset [--cancel]` |
+| Grok section | `grok [--owner b] [--json]`, `group --thread t [--owner b]`, `ungroup --thread t` |
+| Thread actions | `settle`, `unsettle` (Grok threads only, else `--force`), `rename --title x`, `interrupt [--hold]`, `stop`, `subagent-stop --subagent id`, `fork [--run id --title x]`, `model [--model m --effort e --provider p]`, `snooze --until +2h\|HH:MM\|ISO`, `unsnooze`, `resume-at-reset [--cancel]`, `snooze-until-reset [--cancel]` |
 | Scheduled tasks | `tasks [--upsert ... \| --enable id \| --disable id \| --run id \| --delete id --yes]` |
 | Skills | `skills [list] [--from dir] [--to dir]`, `skills install --to dir [--from dir] [--only a,b] [--dry-run] [--force]` (copies these skills into another agent's skills folder; see the repo README) |
 
@@ -147,7 +148,7 @@ The default token scopes don't cover usage or cost totals, T3 settings (includin
 | `unreadable` | That thread couldn't be read. Reported once per distinct error. The other threads still report |
 
 ### t3listen
-Optional. It needs the token and `listen.json`. It follows T3's live events and POSTs question and finish events to the user's webhook routine (t3-phone-answers). Commands: `setup`, `test`, `watch [state,...]`, `install [--approvals]`, `uninstall`, `status`, `preview-finish --thread id|title` (same thread rules as `t3ctl`: full id, an 8+ character prefix, an exact title or one title match, else `AMBIGUOUS`); `--dry-run` prints instead of sending. Events add `turnState` and `turnHint` (running subtask, queued and pending counts; waiting command description). Missing `watch` defaults to `["final","waiting-user","failed","cancelled"]`; opt into `waiting-subagents` or `waiting-command` with `watch`, which prints/sets only the selection without exposing secrets. Unknown states fail startup; restart to apply changes. Filtered mid-job turns do not consume the eventual final. See t3-phone-answers "On an event" for handling. It sends approvals too when `listen.json` has `"approvals": true` or the service was installed with `--approvals`; `status` prints which. Running `install` again keeps the `listen.json` setting and drops the flag unless you pass it again. When a main thread stops on a usage limit, t3listen arms T3's Resume at reset if the project is listed in `autoresume.json` (`{"enabled":true,"projects":[...]}`) or `t3ctl new` started the thread (recorded in `started-here.json` for 60 days).
+Optional. It needs the token and `listen.json`. It follows T3's live events and POSTs question and finish events to the user's webhook routine (t3-phone-answers). Commands: `setup`, `test`, `sweep --owner b [--hours 6] [--all] [--json]`, `reviewed <thread> [--by who] [--undo]` (see "Grok section"), `watch [state,...]`, `install [--approvals]`, `uninstall`, `status`, `preview-finish --thread id|title` (same thread rules as `t3ctl`: full id, an 8+ character prefix, an exact title or one title match, else `AMBIGUOUS`); `--dry-run` prints instead of sending. Events add `turnState` and `turnHint` (running subtask, queued and pending counts; waiting command description). Missing `watch` defaults to `["final","waiting-user","failed","cancelled"]`; opt into `waiting-subagents` or `waiting-command` with `watch`, which prints/sets only the selection without exposing secrets. Unknown states fail startup; restart to apply changes. Filtered mid-job turns do not consume the eventual final. See t3-phone-answers "On an event" for handling. It sends approvals too when `listen.json` has `"approvals": true` or the service was installed with `--approvals`; `status` prints which. Running `install` again keeps the `listen.json` setting and drops the flag unless you pass it again. When a main thread stops on a usage limit, t3listen arms T3's Resume at reset if the project is listed in `autoresume.json` (`{"enabled":true,"projects":[...]}`) or `t3ctl new` started the thread (recorded in `started-here.json` for 60 days).
 
 #### Thread owners (several webhook subscribers)
 When `listen.json` has `subscribers` (`node t3listen subscribers`), every thread's events go to the default subscribers (`"default": true`, e.g. `dev`). That includes threads the user starts by hand. A thread with an owner in `routing.json` goes only to its owner, and its sub-tasks follow it. Who owns a thread depends on its content, not its title:
@@ -157,10 +158,21 @@ When `listen.json` has `subscribers` (`node t3listen subscribers`), every thread
 - A default subscriber that sees a thread belongs to someone else hands it over: `node t3listen claim <thread id> marketing`. From the next event on, only marketing gets it, with no restart. To undo: `node t3listen release <thread id>`. To check: `node t3listen owner <thread id>`, `node t3listen owners`, `node t3listen route --thread <id|title>`. To drop one thread for yourself only: `node t3listen mute <thread id> <you>`.
 - Claim only threads whose content you have read. Never claim a thread for a subscriber that doesn't exist.
 
+#### Grok section
+The Custom T3 sidebar lists threads that bots start in a **Grok** section above Saved. Bots settle the threads in it; the user settles everything in the main list.
+- Membership is in `<T3 home>/custom-t3/grok-shelf.json`, and only t3ctl writes it. `t3ctl new`/`fork --owner <you>` puts the new thread in Grok (`--no-grok` only when the user wants it in the main list). `t3ctl group --thread t [--owner b]` moves a thread in, `t3ctl ungroup --thread t` moves it out, and `t3ctl grok [--owner b]` lists the members. A `t3listen claim` changes routing only, never Grok.
+- `t3ctl settle`/`unsettle` act only on Grok threads. A main-list thread stops with `NOT_GROK`; pass `--force` only when the user asked for that exact thread. With `--owner <you>` (or `T3_OWNER`), another bot's thread stops with `NOT_YOUR_THREAD`.
+- Hourly sweep: each bot runs `node t3listen sweep --owner <you> --json` from an hourly routine (read-only). Each of its Grok threads gets a verdict:
+  - `needs-attention` (error, or waiting on the user): handle it under "Decisions", or tell the user.
+  - `finished-unreviewed`: read the result (`t3ctl read --thread <id> --last 6`), report what matters, then `node t3listen reviewed <id> --by <you>`.
+  - `stale` (idle and reviewed, or idle longer than `--hours`, default 6): settle it with `t3ctl settle --thread <id> --owner <you>` if it is finished and reviewed. If it is not reviewed yet, review it first.
+  - `running-ok`: leave it.
+- A new turn after a review makes the thread unreviewed again. Never settle a running, waiting or unreviewed thread, another bot's thread, or a main-list thread.
+
 ### Other scripts and data files
 - `export.js` writes a redacted JSON export for reports. Options work like t3ctl (`--project Foo` or `--project=Foo`; an unknown option is `USAGE`). `--project` is a filter: an exact id, else a folder, else an exact title (case ignored) picks that project, and two exact matches stop with `AMBIGUOUS` listing them; otherwise every project whose title contains the words is exported, and it prints a note naming them. No `--project` means all. `survey.js` lists activity and stale threads.
 - `t3ui` and `ui-*.applescript` are a macOS-only UI fallback. They use the running T3 Code app, or `T3_APP`.
-- Data files the skills create in the tools folder: `templates.md`, `trackers/`, `update-prefs.json`, `sync-prefs.json`, `sync-backups/`, `out/`, `README.md`, `watch-state.json`, `watch-<name>.json`, `autoresume.json`. `t3ctl new` writes `started-here.json`. t3listen writes `listen.json` (private), `listen-state.json`, `answered-here.json` and `listen.log`.
+- Data files the skills create in the tools folder: `templates.md`, `trackers/`, `update-prefs.json`, `sync-prefs.json`, `sync-backups/`, `out/`, `README.md`, `watch-state.json`, `watch-<name>.json`, `autoresume.json`. `t3ctl new` writes `started-here.json`; t3ctl writes the Grok list `<T3 home>/custom-t3/grok-shelf.json`. `t3listen reviewed` writes `reviewed.json`. t3listen writes `listen.json` (private), `listen-state.json`, `answered-here.json` and `listen.log`.
 - Don't leave scratch files (CSVs, `.bak` copies, screenshots) in the tools folder. Put scratch files in `out/`. On Grok Bot, pages are built on the box (`/workspace`).
 
 ### Master copy
@@ -182,6 +194,9 @@ Scripts print these words. Relay them in plain words, not as errors. This is the
 | `NO_USAGE_CACHE` | Ask the user to open T3's Usage view once |
 | `AMBIGUOUS`, `NO_GOOD_MATCH` | See "Finding a thread". From `t3ctl` or `t3listen preview-finish`, several threads, projects or open approvals match: it lists them; ask which, or pass the id (or the project folder, or `--request <full id>`) |
 | `NOT_FOUND` | No thread matches. List the closest ones and ask |
+| `NOT_GROK` | `t3ctl settle`/`unsettle` refused a main-list thread, which the user settles. Nothing was sent. Use `--force` only when the user asked for that exact thread |
+| `NOT_YOUR_THREAD` | That Grok thread belongs to another bot. Nothing was sent. Leave it to its owner |
+| `GROK_LOCKED`, `BAD_GROK_FILE` | The Grok list is locked by another t3ctl, or unreadable. Nothing changed. Retry, or tell the user |
 | `NOT_PENDING` | That question was already answered or closed |
 | `NOT_ANSWERABLE` | Its run ended, so it can't be answered. Offer a follow-up instead |
 | `NEEDS_USER_APPROVAL` | `t3ctl answer` won't accept that approval on its own. Nothing was sent. Show it to the user, and after their yes for that request rerun with `--user-approved` |

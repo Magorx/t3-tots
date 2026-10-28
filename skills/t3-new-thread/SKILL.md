@@ -22,6 +22,8 @@ Follow the t3-tots-rules skill (skills/t3-tots-rules/SKILL.md), including "Sendi
 - Add `--queue` only when the user wants the follow-up to wait for the run to end.
 - Leave out `--wait` for long coding tasks, say it's running, and offer t3-watch.
 - `--owner <subscriber>` (or env `T3_OWNER`) claims the new thread for one t3listen subscriber, so only that webhook is notified, starting from the first event. Choose it by content, as in t3-tots-rules "Thread owners": game or engine code meant for main is `dev`; video, scenes, posting and social work is `marketing`. Pass your own subscriber: Waterfalls Dev uses `--owner dev`, Waterfalls Marketing uses `--owner marketing`. Without `--owner`, the default subscribers get the thread. If the claim fails, the thread still starts and t3ctl prints the `claim` command to retry.
+- `--owner` also puts the thread in the **Grok** section of the Custom T3 sidebar (t3-tots-rules "Grok section"). The user's main list stays theirs. Add `--no-grok` only when the user wants the thread in the main list; `t3ctl ungroup` moves one out later.
+- Grok threads are yours to finish. Run `node t3listen sweep --owner <you> --json` hourly from your routine. Review each finished result and mark it with `node t3listen reviewed <id> --by <you>`. Settle only your own finished, reviewed Grok threads with `t3ctl settle --thread <id> --owner <you>`. Never settle the user's main-list threads (t3ctl refuses them with `NOT_GROK`).
 - `t3ctl new` records the thread in `started-here.json`, so t3listen arms Resume at reset if the thread later stops on a usage limit.
 
 ## Fallback on macOS

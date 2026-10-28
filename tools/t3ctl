@@ -13,15 +13,16 @@ function t3Dir() { // same for stable and Nightly; T3_HOME may point at the base
   return ["userdata", "dev"].map((d) => path.join(base, d)).find((d) => fs.existsSync(path.join(d, "server-runtime.json"))) || path.join(base, "userdata");
 }
 let BASE = "", H = {};
-function init() {
-  if (+process.versions.node.split(".")[0] < 22 || typeof WebSocket === "undefined" || typeof fetch === "undefined")
-    die("NODE_TOO_OLD", `t3ctl needs Node 22 or newer (found ${process.version}). Install the current LTS from https://nodejs.org`);
+function init(optional = false) {
+  if (+process.versions.node.split(".")[0] < 22 || typeof WebSocket === "undefined" || typeof fetch === "undefined") {
+    if (optional) return false; die("NODE_TOO_OLD", `t3ctl needs Node 22 or newer (found ${process.version}). Install the current LTS from https://nodejs.org`); }
   let rt; try { rt = JSON.parse(fs.readFileSync(path.join(t3Dir(), "server-runtime.json"), "utf8")); }
-  catch { die("T3_NOT_RUNNING", "T3 Code isn't running on this computer (no server-runtime.json). Open T3 Code and try again."); }
+  catch { if (optional) return false; die("T3_NOT_RUNNING", "T3 Code isn't running on this computer (no server-runtime.json). Open T3 Code and try again."); }
   const h = rt.host; BASE = `http://${!h || h === "0.0.0.0" || h === "::" ? "127.0.0.1" : h.includes(":") ? `[${h}]` : h}:${rt.port}`;
   let token = ""; try { token = fs.readFileSync(path.join(__dirname, "token"), "utf8").trim(); } catch {}
-  if (!token) die("NO_TOKEN", "no `token` file next to t3ctl yet. Ask T3 Tots to issue one (setup step), then retry.");
+  if (!token) { if (optional) return false; die("NO_TOKEN", "no `token` file next to t3ctl yet. Ask T3 Tots to issue one (setup step), then retry."); }
   H = { Authorization: "Bearer " + token, "x-t3-orchestration-protocol": "2" };
+  return true;
 }
 const netErr = (e) => new Error(`T3_NOT_REACHABLE: can't reach T3 at ${BASE} (${(e.cause && e.cause.code) || e.message}). Is T3 Code open?`);
 const uuid = () => crypto.randomUUID();
@@ -38,10 +39,55 @@ function claimOwner(id, o, by) {
   if (r.status === 0) { console.log(`owner: ${owner} (t3listen sends this thread's events only to ${owner})`); return true; }
   console.error(`owner not set (${String(r.stderr || r.stdout || r.error || "").trim().split("\n")[0].slice(0, 200)}). Retry: node t3listen claim ${id} ${owner}`); return false;
 }
+// Grok membership is independent of routing owners. Only this writer changes the shelf; readers tolerate damaged files.
+function grokPath(env = process.env, home = HOME) {
+  if (env.T3_CUSTOM_GROK_FILE) return env.T3_CUSTOM_GROK_FILE;
+  let base = (env.T3CODE_HOME || "").trim(); if (base.startsWith("~")) base = path.join(home, base.slice(1));
+  base = base ? path.normalize(base) : path.join(home, ".t3"); if (path.basename(base) === "userdata") base = path.dirname(base);
+  return path.join(base, "custom-t3", "grok-shelf.json");
+}
+const emptyGrok = () => ({ version: 1, threads: {}, out: {} });
+const grokObject = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+function normGrok(j) {
+  const r = emptyGrok(); if (!grokObject(j)) return r;
+  for (const k of ["threads", "out"]) if (grokObject(j[k])) for (const [id, v] of Object.entries(j[k])) if (grokObject(v))
+    Object.defineProperty(r[k], id, { value: { ...(k === "threads" ? { bot: typeof v.bot === "string" ? v.bot : "" } : {}), at: typeof v.at === "string" ? v.at : "", by: typeof v.by === "string" ? v.by : "" }, enumerable: true, configurable: true, writable: true });
+  return r;
+}
+function readGrok(file = grokPath()) { try { return normGrok(JSON.parse(fs.readFileSync(file, "utf8"))); } catch { return emptyGrok(); } }
+function grokLocked(fn, file = grokPath()) { // mkdir lock + strict read + atomic rename; no stale-lock stealing
+  fs.mkdirSync(path.dirname(file), { recursive: true }); const lock = file + ".lock", tmp = file + ".part", t0 = Date.now(), nap = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) { try { fs.mkdirSync(lock); break; } catch (err) { if (err.code !== "EEXIST") throw err;
+    if (Date.now() - t0 >= 15000) throw new Error(`GROK_LOCKED: grok-shelf.json stayed locked for 15s (remove ${lock} if no t3ctl command is running)`);
+    Atomics.wait(nap, 0, 0, 10 + Math.floor(Math.random() * 30)); } }
+  try {
+    let r = emptyGrok(), raw; try { raw = fs.readFileSync(file, "utf8"); } catch (err) { if (err.code !== "ENOENT") throw new Error("BAD_GROK_FILE: grok-shelf.json is unreadable; nothing changed (fix or restore it)"); }
+    if (raw !== undefined) { try { const j = JSON.parse(raw); if (!grokObject(j) || ["threads", "out"].some((k) => j[k] !== undefined && (!grokObject(j[k]) || Object.values(j[k]).some((v) => !grokObject(v))))) throw new Error("shape"); r = normGrok(j); }
+      catch { throw new Error("BAD_GROK_FILE: grok-shelf.json is unreadable; nothing changed (fix or restore it)"); } }
+    const out = fn(r); if (out !== false) { fs.writeFileSync(tmp, JSON.stringify(normGrok(r), null, 1) + "\n", { mode: 0o644 }); fs.chmodSync(tmp, 0o644); fs.renameSync(tmp, file); } return out;
+  } finally { try { fs.unlinkSync(tmp); } catch {} try { fs.rmdirSync(lock); } catch {} }
+}
+function groupGrok(r, id, bot = "", by = "t3ctl group", at = new Date().toISOString()) {
+  Object.defineProperty(r.threads, id, { value: { bot, at, by }, enumerable: true, configurable: true, writable: true }); delete r.out[id];
+}
+function ungroupGrok(r, id, at = new Date().toISOString()) { delete r.threads[id]; Object.defineProperty(r.out, id, { value: { at, by: "t3ctl ungroup" }, enumerable: true, configurable: true, writable: true }); }
+const grokMember = (r, id) => Object.hasOwn(r.threads, id) && !Object.hasOwn(r.out, id);
+function grokGate(r, id, o, env = process.env) {
+  if (o.force) return null; if (!grokMember(r, id)) return { code: "NOT_GROK", msg: "the user settles main-list threads; pass --force only when the user asked for this thread" };
+  const owner = ownerOf(o, env), bot = r.threads[id].bot; return owner && bot && owner !== bot ? { code: "NOT_YOUR_THREAD", msg: `this Grok thread belongs to ${bot}, not ${owner}; pass --force only when the user asked for this thread` } : null;
+}
+function routingOwner(id, file = path.join(__dirname, "routing.json")) { try { const v = JSON.parse(fs.readFileSync(file, "utf8")).owners[id]; return typeof v === "string" ? v : v && typeof v.owner === "string" ? v.owner : ""; } catch { return ""; } }
+function grokRows(r, owner = null, ts = []) { const live = new Map(ts.map((t) => [t.id, t])); return Object.entries(r.threads).filter(([id, v]) => grokMember(r, id) && (!owner || v.bot === owner)).map(([id, v]) => {
+  const t = live.get(id); return { id, bot: v.bot, title: t ? t.title : null, settled: t ? isSettled(t) : null }; }); }
+function addOwnedGrok(id, o, by) {
+  const owner = ownerOf(o); if (!owner || o["no-grok"]) return;
+  try { grokLocked((r) => groupGrok(r, id, owner, by)); console.log(`grok: in the Grok section (owner ${owner})`); }
+  catch (err) { console.error(`${err.message}. Retry: t3ctl group --thread ${id} --owner ${owner}`); }
+}
 function args(a = process.argv.slice(3)) { const o = {}; for (let i = 0; i < a.length; i++) { if (a[i].startsWith("--")) { const eq = a[i].indexOf("=");
   if (eq > 2) { o[a[i].slice(2, eq)] = a[i].slice(eq + 1); continue; }
   const k = a[i].slice(2); const v = a[i + 1] !== undefined && !a[i + 1].startsWith("--") ? a[++i] : true; o[k] = v; } } return o; }
-// flags that always take a value; "--from --to dir" must not read as --from=true
+// flags that always take a value; "--from --to dir" must not read as --from=true. Switches (including --no-grok) need no entry.
 const VALUE_FLAGS = new Set(["thread", "project", "prompt", "prompt-file", "model", "effort", "title", "mode", "attach", "timeout", "from", "to", "only", "text", "pick", "answers",
   "decision", "request", "query", "q", "limit", "last", "number", "repo", "state", "stall-min", "until", "every", "at", "days", "id", "subagent", "edit", "move", "before", "steer",
   "run", "provider", "turn", "reason", "label", "chars", "runtime", "enable", "disable", "delete", "copy", "owner"]);
@@ -488,19 +534,21 @@ function skillsCmd(sub, o) {
   else console.log(`${dry ? "dry run: would install" : "installed"} ${n("new")} new, ${dry ? "update" : "updated"} ${n("update") + (o.force ? n("edited") : 0)}, ${n("same")} up to date, ${o.force ? 0 : n("edited")} kept (changed here)`);
   if (to && !dry) { rec.version = src.version; fs.writeFileSync(path.join(to, SKILLS_RECORD), JSON.stringify(rec, null, 1) + "\n"); }
 }
-const CMDS = ["queue", "projects", "models", "threads", "new", "send", "read", "settle", "unsettle", "rename", "interrupt", "pending", "answer", "diff", "files", "status", "raw", "limits", "resume-at-reset", "snooze-until-reset", "snooze", "unsnooze", "model", "search", "tasks", "prs", "pr", "fork", "stop", "subtasks", "subagent-stop", "watch"];
+const CMDS = ["queue", "projects", "models", "threads", "new", "send", "read", "settle", "unsettle", "group", "ungroup", "grok", "rename", "interrupt", "pending", "answer", "diff", "files", "status", "raw", "limits", "resume-at-reset", "snooze-until-reset", "snooze", "unsnooze", "model", "search", "tasks", "prs", "pr", "fork", "stop", "subtasks", "subagent-stop", "watch"];
 const main = async () => {
   const cmd = process.argv[2], o = args();
   const bare = missingValue(cmd === "skills" ? args(process.argv.slice(3)) : o, cmd);
   if (bare) die("USAGE", `--${bare} needs a value (use --${bare}=<value> for a value that starts with --). Run t3ctl with no arguments for usage.`);
   if (cmd === "skills") return skillsCmd(process.argv[3] && !process.argv[3].startsWith("--") ? process.argv[3] : "list", args(process.argv.slice(3)));
+  if (cmd === "grok") { let ts = []; try { if (init(true)) { const s = await shell(); ts = [...s.threads, ...(s.archivedThreads || [])]; } } catch {}
+    const rows = grokRows(readGrok(), ownerOf(o), ts); if (o.json) console.log(JSON.stringify(rows)); else for (const r of rows) console.log(`${r.id}  bot=${r.bot || "?"}  settled=${r.settled === null ? "?" : r.settled}  ${r.title || "(unavailable)"}`); return; }
   if (CMDS.includes(cmd)) init();
   if (cmd === "projects") { for (const p of (await shell()).projects) console.log(`${p.id}  ${p.title}  ${p.workspaceRoot}`); }
   else if (cmd === "models") { const m = new Map(); for (const t of (await shell()).threads) if (t.modelSelection) m.set(`${t.modelSelection.instanceId} ${t.modelSelection.model}`, (t.modelSelection.options || []).find((x) => /effort|variant/i.test(x.id))?.id || "-"); for (const [k, v] of [...m].sort()) console.log(`${k}  (effort key: ${v})`); }
   else if (cmd === "threads") { const s = await shell(); let ts = s.threads; if (o.project !== undefined) { const p = await findProject(o.project); ts = ts.filter((t) => t.projectId === p.id); } if (o.main) ts = ts.filter(isMainThread); const top = ts.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, +o.limit || 15);
     const ps = await Promise.all(top.map((t) => thread(t.id).then((r) => r.projection, () => null))); top.forEach((t, i) => console.log(threadLine(t, ps[i]))); }
   else if (cmd === "new") {
-    const prompt = promptOf(o); if (!o.project || !prompt) throw new Error("usage: new --project <path|name|id> (--prompt <text> | --prompt-file <path>) [--model m] [--effort e] [--title t] [--mode plan] [--owner subscriber] [--wait [--timeout seconds]]");
+    const prompt = promptOf(o); if (!o.project || !prompt) throw new Error("usage: new --project <path|name|id> (--prompt <text> | --prompt-file <path>) [--model m] [--effort e] [--title t] [--mode plan] [--owner subscriber] [--no-grok] [--wait [--timeout seconds]]");
     const p = await findProject(o.project); const s0 = await shell(); const sel = modelSel(o, p.defaultModelSelection || recentSel(s0, p.id) || recentSel(s0), s0);
     const title = o.title || prompt.slice(0, 60);
     const res = await rpc("orchestration.launchThread", { commandId: uuid(), creationSource: "web", projectId: p.id, title, generateTitle: !o.title,
@@ -509,7 +557,7 @@ const main = async () => {
     try { const sf = path.join(__dirname, "started-here.json"); let m = {}; try { m = JSON.parse(fs.readFileSync(sf, "utf8")) || {}; } catch {} // t3listen auto-resumes threads started here
       const cut = Date.now() - 60 * 864e5; for (const [k, v] of Object.entries(m)) if (!(Date.parse(v) > cut)) delete m[k]; m[res.threadId] = new Date().toISOString(); fs.writeFileSync(sf, JSON.stringify(m)); } catch {}
     console.log(`thread ${res.threadId}  project=${p.title}  model=${JSON.stringify(sel)}`);
-    claimOwner(res.threadId, o, "t3ctl new");
+    claimOwner(res.threadId, o, "t3ctl new"); addOwnedGrok(res.threadId, o, "t3ctl new");
     if (o.wait) { const t = await wait(res.threadId, +o.timeout || 300); console.log(`title: ${t.title}  status: ${t.status}`); await printLast(res.threadId, 2); }
   }
   else if (cmd === "send") {
@@ -544,7 +592,11 @@ const main = async () => {
   }
   else if (cmd === "read") { const t = await findThread(o.thread); console.log(`${t.id}  ${t.title}  status=${t.status}`); await printLast(t.id, +o.last || 6); }
 
-  else if (cmd === "settle" || cmd === "unsettle") { const t = await findThread(o.thread); await dispatch(cmd === "settle" ? "thread.settle" : "thread.unsettle", t.id, cmd === "unsettle" ? { reason: "user" } : {}); const n = (await shell()).threads.find((x) => x.id === t.id); console.log(`${cmd}d "${t.title}"  settledAt=${n.settledAt}  settledOverride=${n.settledOverride}`); }
+  else if (cmd === "group" || cmd === "ungroup") { const t = await findThread(o.thread);
+    if (cmd === "group") { const bot = ownerOf(o) || routingOwner(t.id); grokLocked((r) => groupGrok(r, t.id, bot)); console.log(`grok: in the Grok section (owner ${bot || "unknown"})  ${t.id}`); }
+    else { grokLocked((r) => ungroupGrok(r, t.id)); console.log(`grok: out of the Grok section  ${t.id}`); } }
+  else if (cmd === "settle" || cmd === "unsettle") { const t = await findThread(o.thread), refused = grokGate(readGrok(), t.id, o); if (refused) die(refused.code, refused.msg);
+    await dispatch(cmd === "settle" ? "thread.settle" : "thread.unsettle", t.id, cmd === "unsettle" ? { reason: "user" } : {}); const n = (await shell()).threads.find((x) => x.id === t.id); console.log(`${cmd}d "${t.title}"  settledAt=${n.settledAt}  settledOverride=${n.settledOverride}`); }
   else if (cmd === "rename") { const t = await findThread(o.thread); if (!o.title) throw new Error("--title required"); await dispatch("thread.metadata.update", t.id, { title: String(o.title) }); console.log(`renamed "${t.title}" -> "${o.title}"`); }
   else if (cmd === "interrupt") { const t = await findThread(o.thread); if (!t.activeRunId) { console.log("not running"); return; } await dispatch("run.interrupt", t.id, { runId: t.activeRunId, reason: "t3ctl", holdQueue: !!o.hold }); console.log(`interrupted run in "${t.title}"`); }
   else if (cmd === "pending") { const t = await findThread(o.thread); const pend = pendingOf((await thread(t.id)).projection);
@@ -632,7 +684,7 @@ const main = async () => {
     if (o.run && !runs.some((r) => r.id === o.run)) throw new Error(`no run ${o.run} in "${t.title}" (see: t3ctl raw --thread ${t.id})`);
     const target = `thread:project:${t.projectId}:${uuid()}`;
     await dispatch("thread.fork", undefined, { createdBy: "user", creationSource: "web", sourceThreadId: t.id, targetThreadId: target, sourcePoint: o.run ? { type: "run", runId: String(o.run) } : { type: "latest_stable" }, ...(o.title ? { title: String(o.title) } : {}) });
-    console.log(`forked "${t.title}" -> ${target}${o.title ? `  "${o.title}"` : ""}`); claimOwner(target, o, "t3ctl fork"); }
+    console.log(`forked "${t.title}" -> ${target}${o.title ? `  "${o.title}"` : ""}`); claimOwner(target, o, "t3ctl fork"); addOwnedGrok(target, o, "t3ctl fork"); }
   else if (cmd === "stop") { // run.interrupt with holdQueue: T3 also stops the thread's delegated sub-tasks (thread.stop is server-internal)
     const t = await findThread(o.thread); if (!t.activeRunId) { console.log(`"${t.title}" isn't running (nothing to stop)`); return; }
     await dispatch("run.interrupt", t.id, { runId: t.activeRunId, reason: String(o.reason || "t3ctl stop"), holdQueue: true });
@@ -658,7 +710,7 @@ const main = async () => {
     const tmp = `${sf}.${process.pid}.tmp`; fs.writeFileSync(tmp, JSON.stringify(st, null, 1)); fs.renameSync(tmp, sf);
     if (o.json) { if (out.length) console.log(JSON.stringify({ changes: out, threads: snaps.map(({ reply, ...x }) => x) })); return; }
     for (const e of out) console.log(`${e.kind}  "${e.title}"  ${e.text}`); }
-  else console.log("t3ctl projects | models | threads [--project p] [--main] [--limit n] | new --project p --prompt t [--model m --effort e] [--owner subscriber (or env T3_OWNER)] [--wait [--timeout seconds]] | send --thread id|title --prompt t [--wait [--timeout seconds]] [--queue] | queue --thread t [--steer runId|all | --cancel runId|all] | read --thread id|title [--last N] | settle|unsettle --thread t | rename --thread t --title x | interrupt --thread t [--hold] | status --thread t [--json] | pending --thread t [--json] | answer --thread t [--request id] (--pick label | --text txt | --answers json | --decision accept|decline|... [--user-approved] [--redirect]) | diff --thread t | files --thread t [--last-turn] [--copy no] | limits [--json] | snooze --thread t --until +2h|HH:MM|ISO | unsnooze --thread t | queue --thread t (--resume | --edit runId --text x | --move runId [--before runId|end | --first]) | model --thread t [--model m] [--effort e] [--provider p] | search --query q [--limit n] | tasks [--upsert ... [--prompt-file f] | --enable id | --disable id | --run id | --delete id --yes] | prs --project p [--state open] | pr --thread t [--number n] [--all] | pr --project p --repo o/r --number n | fork --thread t [--run runId] [--title x] [--owner subscriber] | stop --thread t | subtasks --thread t [--all] | subagent-stop --thread t --subagent id | resume-at-reset --thread t [--cancel] | snooze-until-reset --thread t [--cancel] | watch --thread a[,b] [--state file] [--stall-min 20] [--json] | new/send ... --attach img1.png,img2.jpg | new/send ... --prompt-file p.md | send ... --no-verify | skills [list] [--from dir] [--to dir] | skills install --to dir [--from dir] [--only a,b] [--dry-run] [--force]");
+  else console.log("t3ctl projects | models | threads [--project p] [--main] [--limit n] | new --project p --prompt t [--model m --effort e] [--owner subscriber (or env T3_OWNER)] [--no-grok] [--wait [--timeout seconds]] | send --thread id|title --prompt t [--wait [--timeout seconds]] [--queue] | queue --thread t [--steer runId|all | --cancel runId|all] | read --thread id|title [--last N] | group --thread t [--owner X] | ungroup --thread t | grok [--owner X] [--json] | settle|unsettle --thread t [--owner X] [--force] | rename --thread t --title x | interrupt --thread t [--hold] | status --thread t [--json] | pending --thread t [--json] | answer --thread t [--request id] (--pick label | --text txt | --answers json | --decision accept|decline|... [--user-approved] [--redirect]) | diff --thread t | files --thread t [--last-turn] [--copy no] | limits [--json] | snooze --thread t --until +2h|HH:MM|ISO | unsnooze --thread t | queue --thread t (--resume | --edit runId --text x | --move runId [--before runId|end | --first]) | model --thread t [--model m] [--effort e] [--provider p] | search --query q [--limit n] | tasks [--upsert ... [--prompt-file f] | --enable id | --disable id | --run id | --delete id --yes] | prs --project p [--state open] | pr --thread t [--number n] [--all] | pr --project p --repo o/r --number n | fork --thread t [--run runId] [--title x] [--owner subscriber] [--no-grok] | stop --thread t | subtasks --thread t [--all] | subagent-stop --thread t --subagent id | resume-at-reset --thread t [--cancel] | snooze-until-reset --thread t [--cancel] | watch --thread a[,b] [--state file] [--stall-min 20] [--json] | new/send ... --attach img1.png,img2.jpg | new/send ... --prompt-file p.md | send ... --no-verify | skills [list] [--from dir] [--to dir] | skills install --to dir [--from dir] [--only a,b] [--dry-run] [--force]");
 };
-if (require.main !== module) module.exports = { ownerOf, claimOwner, skillHash, args, missingValue, pickThread, pickProject, outPath, sensitivePath, sensitiveName, SENSITIVE_NAME, isMainThread, limitLine, localT, tzName, isSettled, threadLine, decodeText, approvalAllowed, redirectText, deliveryOf, stallHint, watchSnap, watchDiff, pendingOf, requestInfo, parseWhen, parseEvery, buildAnswer, matchOption };
+if (require.main !== module) module.exports = { grokPath, emptyGrok, normGrok, readGrok, grokLocked, groupGrok, ungroupGrok, grokMember, grokGate, routingOwner, grokRows, ownerOf, claimOwner, skillHash, args, missingValue, pickThread, pickProject, outPath, sensitivePath, sensitiveName, SENSITIVE_NAME, isMainThread, limitLine, localT, tzName, isSettled, threadLine, decodeText, approvalAllowed, redirectText, deliveryOf, stallHint, watchSnap, watchDiff, pendingOf, requestInfo, parseWhen, parseEvery, buildAnswer, matchOption };
 else main().catch((e) => { const m = String(e.message).match(/"message":"([^"]{3,300})"/); const msg = m && /^\[\{"_tag":"Fail"/.test(e.message) ? m[1] : e.message; console.error(/^[A-Z][A-Z0-9_]{3,}[: (]/.test(msg) ? msg : `error: ${msg}`); process.exit(1); });

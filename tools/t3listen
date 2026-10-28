@@ -825,24 +825,25 @@ function subscribers() {
   if (!Array.isArray(c.subscribers)) { console.log(`no subscribers list: every event goes to the single webhook (url ${c.url ? "set" : "MISSING"}, ${Object.keys(c.headers || {}).length} header(s); watch ${defWatch.join(",") || "(none)"})`); return; }
   console.log(c.subscribers.length ? c.subscribers.map((x) => describeSub(x, defWatch)).join("\n") : "subscribers list is empty: no events are sent");
 }
-function routingLocked(fn) { // lock dir + strict read + atomic rename; safe with several agents at once
-  const lock = ROUTING + ".lock", t0 = Date.now(), nap = new Int32Array(new SharedArrayBuffer(4));
+function jsonLocked(file, empty, normalise, word, fn) { // lock dir + strict read + atomic rename; safe with several agents at once
+  const lock = file + ".lock", name = path.basename(file), t0 = Date.now(), nap = new Int32Array(new SharedArrayBuffer(4));
   for (;;) {
     try { fs.mkdirSync(lock); break; } catch (err) {
       if (err.code !== "EEXIST") throw err;
       try { if (Date.now() - fs.statSync(lock).mtimeMs > 10000) { fs.rmdirSync(lock); continue; } } catch {}
-      if (Date.now() - t0 > 15000) die("ROUTING_LOCKED", `routing.json stayed locked for 15s (remove ${lock} if no t3listen command is running)`);
+      if (Date.now() - t0 > 15000) throw new Error(`${word}_LOCKED: ${name} stayed locked for 15s (remove ${lock} if no t3listen command is running)`);
       Atomics.wait(nap, 0, 0, 10 + Math.floor(Math.random() * 30));
     }
   }
   try {
-    let r = emptyRouting();
-    if (fs.existsSync(ROUTING)) { try { r = normRouting(JSON.parse(fs.readFileSync(ROUTING, "utf8"))); } catch { die("BAD_ROUTING", "routing.json is unreadable; nothing changed (fix or restore it)"); } }
+    let r = empty();
+    if (fs.existsSync(file)) { try { r = normalise(JSON.parse(fs.readFileSync(file, "utf8"))); } catch { throw new Error(`BAD_${word}: ${name} is unreadable; nothing changed (fix or restore it)`); } }
     const out = fn(r);
-    if (out !== false && !DRY) { const tmp = `${ROUTING}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.part`; fs.writeFileSync(tmp, JSON.stringify(r, null, 1) + "\n", { mode: 0o600 }); fs.renameSync(tmp, ROUTING); lockDown(ROUTING); }
+    if (out !== false && !DRY) { const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.part`; fs.writeFileSync(tmp, JSON.stringify(r, null, 1) + "\n", { mode: 0o600 }); fs.renameSync(tmp, file); lockDown(file); }
     return out;
   } finally { try { fs.rmdirSync(lock); } catch {} }
 }
+const routingLocked = (fn) => jsonLocked(ROUTING, emptyRouting, normRouting, "ROUTING", fn);
 const subNames = () => { const c = readJSON(CONF, null); return c && Array.isArray(c.subscribers) ? c.subscribers.map((x) => x && x.name).filter(Boolean) : []; };
 function claimMany(ids, owner, by = "t3listen claim") { // -> { claimed, already, was: { id: previous owner } }
   const at = new Date().toISOString(), res = { claimed: 0, already: 0, was: {} };
@@ -860,6 +861,101 @@ async function threadRef(q) { // exact id with --exact (fast, no T3 call); else 
   for (const pr of sh.projects || []) meta.projects.set(pr.id, pr.title); for (const t of sh.threads || []) meta.threads.set(t.id, t);
   try { const t = pickThread([...(sh.threads || []), ...(sh.archivedThreads || [])], q); meta.threads.set(t.id, t); return { id: t.id, title: t.title, t }; }
   catch (err) { const [w, ...rest] = err.message.split(": "); if (w === "NOT_FOUND" && idLike(q)) return { id: q, title: null }; die(w, rest.join(": ")); }
+}
+
+// ---------- Grok review / read-only sweep ----------
+const REVIEWED = path.join(DIR, "reviewed.json"), objectMap = (v) => v && typeof v === "object" && !Array.isArray(v) ? v : {};
+const emptyReviewed = () => ({ version: 1, threads: {} });
+const normReviewed = (j) => ({ version: 1, threads: objectMap(j && j.threads) });
+function grokFile(env = process.env, home = HOME) { // membership uses T3CODE_HOME's base, not the runtime discovery directory
+  const base = path.resolve(env.T3CODE_HOME || path.join(home, ".t3"));
+  return env.T3_CUSTOM_GROK_FILE || path.join(path.basename(base) === "userdata" ? path.dirname(base) : base, "custom-t3", "grok-shelf.json");
+}
+const readGrok = () => readJSON(grokFile(), {});
+function sweepMembers(shelf, routing, owner) { // routing alone never implies membership; an explicit bot takes precedence
+  return Object.entries(objectMap(shelf && shelf.threads)).filter(([id, m]) => !Object.hasOwn(objectMap(shelf && shelf.out), id)
+    && ((m && m.bot) ? m.bot === owner : ownerName(routing, id) === owner)).map(([id]) => id);
+}
+function activityAt(t = {}, p = {}) {
+  const entries = [t, p.thread || {}, ...(p.runs || []), ...Object.values(p.turnItems || {}), ...(p.runtimeRequests || [])];
+  const times = entries.flatMap((x) => [x.createdAt, x.updatedAt, x.startedAt, x.completedAt, x.resolvedAt, x.lastActivityAt]).map(Date.parse).filter(Number.isFinite);
+  return times.length ? new Date(Math.max(...times)).toISOString() : null;
+}
+function sweepStatus(t = {}, p = {}, now = Date.now()) { // pure: shell thread + projection -> current status and activity
+  const tt = { ...(p.thread || {}), ...t }, runs = [...(p.runs || [])].sort((a, b) => (a.ordinal || 0) - (b.ordinal || 0)
+    || (Date.parse(a.startedAt || a.createdAt) || 0) - (Date.parse(b.startedAt || b.createdAt) || 0));
+  const run = runs.find((r) => r.id === tt.latestRunId) || runs.at(-1);
+  const open = (r) => r && r.status === "pending" && !SKIP_KINDS.has(r.kind);
+  const pending = (p.runtimeRequests || []).some(open) || (tt.pendingRuntimeRequest && !SKIP_KINDS.has(tt.pendingRuntimeRequest.kind)
+    && (!tt.pendingRuntimeRequest.status || open(tt.pendingRuntimeRequest)));
+  const failed = [tt.status, run && run.status].some((s) => s === "failed" || s === "error");
+  const interrupted = run && run.status === "interrupted" && (run.lastError || run.error || run.lastErrorClass || tt.lastError
+    || Object.values(p.turnItems || {}).some((i) => i.type === "error" && i.runId === run.id));
+  const status = pending ? "waiting-user" : isActive(tt) || (run && ACTIVE.has(run.status)) ? "running"
+    : failed || interrupted || tt.lastError ? "error" : "idle-finished";
+  const lastActivityAt = activityAt(t, p), ageMin = lastActivityAt ? Math.max(0, (now - Date.parse(lastActivityAt)) / 6e4) : null;
+  return { status, lastActivityAt, ageMin };
+}
+const sweepVerdict = ({ status, reviewed, ageMin, settled, gone }, hours = 6) => gone ? "gone" : settled ? "settled"
+  : status === "error" || status === "waiting-user" ? "needs-attention" : status === "running" ? "running-ok"
+  : reviewed || (ageMin !== null && ageMin > hours * 60) ? "stale" : "finished-unreviewed";
+const sweepSettled = (t) => t.settledOverride === "settled" || (!!t.settledAt && t.settledOverride !== "unsettled");
+function sweepReport({ owner, hours = 6, all = false, shelf = {}, routing = emptyRouting(), reviewed = {}, snapshots = {} }, now = Date.now()) {
+  const threads = [], counts = {};
+  for (const id of sweepMembers(shelf, routing, owner)) {
+    const snap = snapshots[id], gone = !snap || !snap.p, t = { ...((snap && snap.p && snap.p.thread) || {}), ...((snap && snap.t) || {}) };
+    const state = gone ? { status: null, lastActivityAt: null, ageMin: null } : sweepStatus(t, snap.p, now), mark = objectMap(reviewed.threads)[id];
+    const row = { id, title: clean(t.title || id), ...state, reviewed: !!(mark && state.lastActivityAt && Date.parse(mark.upTo) >= Date.parse(state.lastActivityAt)),
+      reviewedAt: (mark && mark.at) || null };
+    row.verdict = sweepVerdict({ ...row, gone, settled: sweepSettled(t) }, hours);
+    counts[row.verdict] = (counts[row.verdict] || 0) + 1;
+    if (row.verdict !== "settled" || all) threads.push(row);
+  }
+  return { owner, checkedAt: new Date(now).toISOString(), hours, threads, counts };
+}
+function markReviewed(id, { by = "t3listen reviewed", upTo, undo = false, now = Date.now() } = {}) {
+  if (!undo && !Number.isFinite(Date.parse(upTo))) throw new Error("NO_ACTIVITY: no thread activity timestamp; nothing changed");
+  return jsonLocked(REVIEWED, emptyReviewed, normReviewed, "REVIEWED", (r) => {
+    if (undo) { if (!Object.hasOwn(r.threads, id)) return false; delete r.threads[id]; }
+    else r.threads[id] = { at: new Date(now).toISOString(), by, upTo };
+    return true;
+  });
+}
+async function reachableShell(ep) {
+  if (!ep) throw new Error("T3_NOT_REACHABLE: open T3 Code");
+  try {
+    const r = await fetch(`${ep.base}/api/orchestration/shell`, { headers: ep.H, signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const sh = await r.json(); if (!Array.isArray(sh.threads)) throw new Error("missing thread list"); return sh;
+  } catch (err) { throw new Error(`T3_NOT_REACHABLE: couldn't read T3 (${err.message})`); }
+}
+async function reviewed() {
+  const [q] = positional(); if (!q || (flag("--by") && !optv("--by")) || argv.includes("--by=")) die("USAGE", "reviewed <thread> [--by who] [--undo]");
+  const t = await threadRef(q); let upTo;
+  if (!flag("--undo")) {
+    const ep = endpoint(); if (!ep) die("T3_NOT_REACHABLE", "open T3 Code to read the thread's last activity");
+    let p; try { p = await threadSnap(ep, t.id); } catch { die("T3_NOT_REACHABLE", "couldn't read the thread's last activity"); }
+    if (!p) die("NOT_FOUND", `no thread matches "${q}"`);
+    upTo = activityAt(t.t || {}, p);
+  }
+  const changed = markReviewed(t.id, { upTo, by: optv("--by") || "t3listen reviewed", undo: flag("--undo") });
+  console.log(`${DRY ? "would " : ""}${flag("--undo") ? changed ? "unreviewed" : "not reviewed" : "reviewed"}: ${t.id}`);
+}
+async function sweep() {
+  const owner = optv("--owner"), hoursArg = optv("--hours"), hours = hoursArg === undefined ? 6 : Number(hoursArg);
+  if (!owner || ((flag("--hours") || argv.includes("--hours=")) && hoursArg === undefined) || !Number.isFinite(hours) || hours < 0)
+    die("USAGE", "sweep --owner X [--hours N (default 6)] [--all] [--json]");
+  const ep = endpoint(), sh = await reachableShell(ep), shelf = readGrok(), routing = readRouting(), snapshots = {};
+  const ts = new Map([...(sh.archivedThreads || []), ...sh.threads].map((t) => [t.id, t]));
+  for (const id of sweepMembers(shelf, routing, owner)) {
+    let p; try { p = await threadSnap(ep, id); } catch { die("T3_NOT_REACHABLE", "couldn't read a Grok member; sweep is incomplete"); }
+    if (p === undefined) die("T3_NOT_REACHABLE", "T3 returned no thread snapshot; sweep is incomplete");
+    snapshots[id] = { t: ts.get(id), p };
+  }
+  const out = sweepReport({ owner, hours, all: flag("--all"), shelf, routing, reviewed: normReviewed(readJSON(REVIEWED, {})), snapshots });
+  if (flag("--json")) console.log(JSON.stringify(out));
+  else { for (const t of out.threads) console.log(`${t.id}  ${t.verdict}  ${t.status || "-"}  ${t.ageMin === null ? "?" : Math.round(t.ageMin)}m  ${trim(t.title, 90)}`);
+    console.log(`counts: ${Object.entries(out.counts).map(([v, n]) => `${v}=${n}`).join(", ") || "(none)"}`); }
 }
 async function claim() {
   const [q, owner] = positional(); if (!q || !owner) die("USAGE", "claim <thread id|title> <subscriber> [--exact] [--by who]");
@@ -968,9 +1064,11 @@ t3listen unsubscribe <name> | subscribers   remove one / list names, watch and m
 t3listen claim <thread> <subscriber> [--exact] [--by who]   only that subscriber gets the thread (and its sub-tasks) from now on; no restart needed
 t3listen release <thread> | owner <thread> | owners [--limit n]   back to the default subscribers / show one thread's owner and route / counts and the last 20
 t3listen mute|unmute <thread> <subscriber>   drop (or restore) one thread and its sub-tasks for one subscriber
+t3listen reviewed <thread> [--by who] [--undo]   mark the thread's current activity reviewed, or undo the mark
+t3listen sweep --owner X [--hours N (default 6)] [--all] [--json]   read-only Grok member status and review verdicts (settled skipped unless --all)
 t3listen route [--thread id|title | --title T --branch B --project P --thread-id ID --delegated] [--state final] [--list]   which subscribers would get it (sends nothing)
 t3listen test [--subscriber name]   send one test event (test: true) to every subscriber, or one
 t3listen preview-finish --thread id|title   print the run-end event for a thread's latest ended run (sends nothing)
 t3listen install [--approvals] | uninstall | status   start at login (macOS LaunchAgent, Windows logon task, Linux systemd --user)`;
-if (require.main !== module) module.exports = { watchList, turnDetails, pickThread, idLike, systemdUnit, localTime, configFrom, routeFor, claimMany, readRouting, ownerOf, emptyRouting, ROUTING, rulesHit, compileRules, globRe, threadMatches, approvalsLine, staleMinutes, RED, clean, cleanEvent, summary, requestInfo, endedAt, tickLastAlive, catchUpThreads, afterSnapshotListen, usageLimitFields, shellReadyToArm, canArmResume };
-else ({ run, setup, watch: async () => watch(), test, "preview-finish": previewFinish, subscribe: async () => subscribe(), unsubscribe: async () => unsubscribe(), subscribers: async () => subscribers(), route, claim, release, owner, owners, mute: () => mute(true), unmute: () => mute(false), install: async () => install(), uninstall: async () => uninstall(), status: async () => status() }[cmd] || (async () => console.log(USAGE)))().catch((e) => { console.error("error:", e.message); process.exit(1); });
+if (require.main !== module) module.exports = { watchList, turnDetails, pickThread, idLike, systemdUnit, localTime, configFrom, routeFor, claimMany, readRouting, ownerOf, emptyRouting, ROUTING, rulesHit, compileRules, globRe, threadMatches, approvalsLine, staleMinutes, RED, clean, cleanEvent, summary, requestInfo, endedAt, tickLastAlive, catchUpThreads, afterSnapshotListen, usageLimitFields, shellReadyToArm, canArmResume, grokFile, readGrok, sweepMembers, activityAt, sweepStatus, sweepVerdict, sweepReport, markReviewed };
+else ({ run, setup, watch: async () => watch(), test, "preview-finish": previewFinish, subscribe: async () => subscribe(), unsubscribe: async () => unsubscribe(), subscribers: async () => subscribers(), route, claim, release, owner, owners, reviewed, sweep, mute: () => mute(true), unmute: () => mute(false), install: async () => install(), uninstall: async () => uninstall(), status: async () => status() }[cmd] || (async () => console.log(USAGE)))().catch((e) => { console.error("error:", e.message); process.exit(1); });
