@@ -2,8 +2,8 @@
 // t3listen - tells T3 Tots the moment a T3 Code thread asks a question (and when it's answered or closed),
 // and when a thread's run finishes, fails or is cancelled (sub-task threads only when they fail; usage-limit stops in
 // projects listed in autoresume.json, or in threads T3 Tots started, get T3's "Resume at reset" armed, see autoResumeSet),
-// by POSTing JSON to the webhook in listen.json. No polling: it follows T3's live event stream. Needs Node 22+.
-// The webhook URL and headers live only in listen.json next to this script and are never printed.
+// by POSTing JSON to the webhook in listen.json (or to each matching entry of its "subscribers" list). No polling: it follows
+// T3's live event stream. Needs Node 22+. Webhook URLs and headers live only in listen.json next to this script and are never printed.
 const fs = require("fs"), path = require("path"), os = require("os"), crypto = require("crypto"), cp = require("child_process");
 const HOME = os.homedir(), DIR = __dirname, CONF = path.join(DIR, "listen.json"), HERE = path.join(DIR, "answered-here.json"), STATE = path.join(DIR, "listen-state.json"), LOG = path.join(DIR, "listen.log"), PID = path.join(DIR, "listen.pid");
 const LABEL = process.env.T3LISTEN_LABEL || "com.t3tots.listen", TASK = process.env.T3LISTEN_LABEL || "T3 Tots listener";
@@ -11,6 +11,9 @@ const argv = process.argv.slice(2), cmd = argv[0] && !argv[0].startsWith("--") ?
 const optv = (f) => { // --key value or --key=value, like t3ctl
   const eq = argv.find((a) => a.startsWith(f + "=")); if (eq !== undefined) return eq.slice(f.length + 1) || undefined;
   const i = argv.indexOf(f); return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[i + 1] : undefined; };
+const optAll = (f) => { const out = []; // every --key value / --key=value (repeatable flags)
+  for (let i = 0; i < argv.length; i++) { const a = argv[i]; if (a.startsWith(f + "=")) out.push(a.slice(f.length + 1)); else if (a === f && argv[i + 1] !== undefined && !argv[i + 1].startsWith("--")) out.push(argv[++i]); }
+  return out; };
 const DRY = flag("--dry-run"), ONCE = flag("--once"), TOLOG = flag("--log"), VERBOSE = flag("--verbose");
 function log(...a) {
   const line = `${new Date().toISOString()} ${a.join(" ")}`;
@@ -31,13 +34,76 @@ function watchList(v) {
   if (!Array.isArray(v) || v.some((s) => !TURN_STATES.includes(s))) throw new Error(`BAD_LISTEN_CONFIG: watch must be an array containing only: ${TURN_STATES.join(", ")}`);
   return [...new Set(v)];
 }
+const okUrl = (u) => /^https:\/\//.test(u || "") || /^http:\/\/(127\.0\.0\.1|localhost)[:/]/.test(u || "");
+// ---------- subscribers: several webhooks, each with its own watch list and thread rules ----------
+// listen.json "subscribers": [{ name, url, headers?, watch?, match?: { include?, exclude? }, delegated?, delegatedMatch?, enabled? }]
+// rules (include / exclude): titlePrefix (case-insensitive), titleRegex ("text" = case-insensitive, or "/re/flags"), branch (glob),
+// threadId (glob), project (case-insensitive glob). include: a thread must hit at least one rule (none = every thread); exclude: any hit drops it.
+// delegated (sub-task threads): "failed" (default, as before: run ends only when they fail), "all", or "none" (no events at all);
+// delegatedMatch: "parent" (default: a sub-task thread is matched by its parent thread's title/branch/id/project) or "self".
+// No "subscribers" key = exactly the old single webhook (top-level url/headers/watch).
+const SUB_NAME = /^[A-Za-z0-9_.-]{1,40}$/, DELEGATED_MODES = ["failed", "all", "none"], DELEGATED_MATCH = ["parent", "self"];
+const RULE_KEYS = ["titlePrefix", "titleRegex", "branch", "threadId", "project"];
+const asList = (v) => (v === undefined || v === null ? [] : (Array.isArray(v) ? v : [v]).map(String).filter((x) => x !== ""));
+const splitList = (v) => String(v).split(",").map((x) => x.trim()).filter(Boolean);
+const globRe = (g, fl = "") => new RegExp("^" + String(g).replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", fl);
+function textRe(x) {
+  const m = String(x).match(/^\/(.*)\/([dgimsuvy]*)$/s);
+  try { return m ? new RegExp(m[1], m[2].replace(/[gy]/g, "")) : new RegExp(x, "i"); } catch (err) { throw new Error(`BAD_LISTEN_CONFIG: bad titleRegex ${JSON.stringify(x)}: ${err.message}`); }
+}
+function compileRules(r, where) {
+  if (r === undefined || r === null) return null;
+  if (typeof r !== "object" || Array.isArray(r)) throw new Error(`BAD_LISTEN_CONFIG: ${where} must be an object`);
+  for (const k of Object.keys(r)) if (!RULE_KEYS.includes(k)) throw new Error(`BAD_LISTEN_CONFIG: ${where} has unknown rule "${k}" (use ${RULE_KEYS.join(", ")})`);
+  const c = { titlePrefix: asList(r.titlePrefix).map((x) => x.toLowerCase()), titleRegex: asList(r.titleRegex).map(textRe), branch: asList(r.branch).map((g) => globRe(g)),
+    threadId: asList(r.threadId).map((g) => globRe(g)), project: asList(r.project).map((g) => globRe(g, "i")) };
+  return RULE_KEYS.some((k) => c[k].length) ? c : null;
+}
+function rulesHit(c, x) { // x: { threadId, title, branch, project }
+  const title = String(x.title || ""), low = title.toLowerCase();
+  return c.titlePrefix.some((p) => low.startsWith(p)) || c.titleRegex.some((re) => re.test(title)) || (x.branch != null && c.branch.some((re) => re.test(String(x.branch))))
+    || c.threadId.some((re) => re.test(String(x.threadId || ""))) || (x.project != null && c.project.some((re) => re.test(String(x.project))));
+}
+const threadMatches = (sub, x) => !(sub.exclude && rulesHit(sub.exclude, x)) && (!sub.include || rulesHit(sub.include, x));
+function subscriberOf(x, i, defWatch) {
+  if (!x || typeof x !== "object" || Array.isArray(x)) throw new Error(`BAD_LISTEN_CONFIG: subscribers[${i}] must be an object`);
+  const name = String(x.name || ""); if (!SUB_NAME.test(name)) throw new Error(`BAD_LISTEN_CONFIG: subscribers[${i}] needs a "name" (letters, digits, . _ -)`);
+  const watch = x.watch === undefined ? [...defWatch] : watchList(typeof x.watch === "string" ? splitList(x.watch) : x.watch);
+  const delegated = x.delegated ?? "failed", delegatedMatch = x.delegatedMatch ?? "parent";
+  if (!DELEGATED_MODES.includes(delegated)) throw new Error(`BAD_LISTEN_CONFIG: subscriber "${name}" delegated must be one of ${DELEGATED_MODES.join(", ")}`);
+  if (!DELEGATED_MATCH.includes(delegatedMatch)) throw new Error(`BAD_LISTEN_CONFIG: subscriber "${name}" delegatedMatch must be one of ${DELEGATED_MATCH.join(", ")}`);
+  const m = x.match ?? {}; if (typeof m !== "object" || Array.isArray(m)) throw new Error(`BAD_LISTEN_CONFIG: subscriber "${name}" match must be an object`);
+  for (const k of Object.keys(m)) if (!["include", "exclude"].includes(k)) throw new Error(`BAD_LISTEN_CONFIG: subscriber "${name}" match has unknown key "${k}" (use include, exclude)`);
+  return { name, url: x.url, headers: x.headers || {}, watch, delegated, delegatedMatch, enabled: x.enabled !== false,
+    include: compileRules(m.include, `subscriber "${name}" match.include`), exclude: compileRules(m.exclude, `subscriber "${name}" match.exclude`) };
+}
+function configFrom(c, opts = {}) { // pure: listen.json object -> runtime config (throws BAD_LISTEN_CONFIG)
+  const defWatch = watchList(c.watch), multi = c.subscribers !== undefined;
+  if (multi && !Array.isArray(c.subscribers)) throw new Error("BAD_LISTEN_CONFIG: subscribers must be an array");
+  const subscribers = multi ? c.subscribers.map((x, i) => subscriberOf(x, i, defWatch))
+    : [{ name: "default", url: c.url, headers: c.headers || {}, watch: defWatch, delegated: "failed", delegatedMatch: "self", enabled: true, include: null, exclude: null, legacy: true }];
+  const names = subscribers.map((x) => x.name), dup = names.find((n, i) => names.indexOf(n) !== i);
+  if (dup) throw new Error(`BAD_LISTEN_CONFIG: two subscribers are named "${dup}"`);
+  if (!opts.dry) for (const x of subscribers) if (x.enabled && !okUrl(x.url)) throw new Error(multi ? `BAD_LISTEN_CONFIG: subscriber "${x.name}" url must start with https:// (http only for localhost)` : "BAD_LISTEN_CONFIG: listen.json url must start with https:// (http only for localhost)");
+  return { url: c.url, headers: c.headers || {}, machine: c.machine || os.hostname().replace(/\.local$/, ""), approvals: c.approvals === true || !!opts.approvals,
+    watch: [...new Set(subscribers.filter((x) => x.enabled).flatMap((x) => x.watch))], skipStaleMinutes: staleMinutes(c.skipStaleMinutes), multi, subscribers };
+}
 function loadConfig() {
   const c = readJSON(CONF, null);
-  if (!c) { if (DRY && !fs.existsSync(CONF)) return { machine: os.hostname().replace(/\.local$/, ""), approvals: flag("--approvals"), watch: watchList(), skipStaleMinutes: staleMinutes(optv("--skip-stale")) };
+  if (!c) { if (DRY && !fs.existsSync(CONF)) return { ...configFrom({}, { dry: true, approvals: flag("--approvals") }), skipStaleMinutes: staleMinutes(optv("--skip-stale")) };
     die("NO_LISTEN_CONFIG", `no listen.json next to t3listen. Create it with: node "${path.join(DIR, "t3listen")}" setup  (or use --dry-run)`); }
-  if (!DRY && !/^https:\/\//.test(c.url || "") && !/^http:\/\/(127\.0\.0\.1|localhost)[:/]/.test(c.url || "")) die("BAD_LISTEN_CONFIG", "listen.json url must start with https:// (http only for localhost)");
-  return { url: c.url, headers: c.headers || {}, machine: c.machine || os.hostname().replace(/\.local$/, ""), approvals: c.approvals === true || flag("--approvals"),
-    watch: watchList(c.watch), skipStaleMinutes: staleMinutes(c.skipStaleMinutes) };
+  try { return configFrom(c, { dry: DRY, approvals: flag("--approvals") }); }
+  catch (err) { const [code, ...rest] = err.message.split(": "); if (code === "BAD_LISTEN_CONFIG" && !/watch must be/.test(err.message)) die(code, rest.join(": ")); throw err; }
+}
+// which subscribers get event e. info: { self: {threadId,title,branch,project}, parent: same or null, delegated }
+const stateOf = (e) => e.turnState || (e.requestId ? "waiting-user" : END_STATE[e.event] || "final");
+function routeFor(subs, e, info) {
+  const state = stateOf(e);
+  return subs.filter((x) => {
+    if (!x.enabled || (e.event !== "test" && !x.watch.includes(state))) return false;
+    if (info.delegated && (x.delegated === "none" || (x.delegated === "failed" && END_WORD[e.event] && e.event !== "thread.failed"))) return false;
+    return threadMatches(x, info.delegated && x.delegatedMatch === "parent" && info.parent ? info.parent : info.self);
+  });
 }
 function watch() { // change only the public selection; never print the URL or headers
   const c = readJSON(CONF, null), value = argv[1] && argv[1].startsWith("--") ? undefined : argv[1];
@@ -68,6 +134,7 @@ async function setup() { // stdin: line 1 = webhook URL, then "Header-Name: valu
   const old = readJSON(CONF, {}), c = { ...old, url, headers, machine: optv("--machine") || old.machine || os.hostname().replace(/\.local$/, ""), approvals: old.approvals === true, skipStaleMinutes: old.skipStaleMinutes ?? 1440 };
   const tmp = CONF + ".part"; fs.writeFileSync(tmp, JSON.stringify(c, null, 1) + "\n", { mode: 0o600 }); fs.renameSync(tmp, CONF); lockDown(CONF);
   console.log(`saved listen.json (url set, ${Object.keys(headers).length} header(s), machine "${c.machine}", approvals ${c.approvals ? "on" : "off"}). Test it with: node "${path.join(DIR, "t3listen")}" test`);
+  if (Array.isArray(c.subscribers)) console.log(`note: listen.json has a "subscribers" list, so this top-level url is not used. Add webhooks with: node "${path.join(DIR, "t3listen")}" subscribe <name> --url-file <path>`);
 }
 
 // ---------- T3 connection (same discovery as t3ctl) ----------
@@ -141,13 +208,14 @@ const answeredHere = (id) => { const m = readJSON(HERE, {}) || {}; return !!m[cr
 let C, queue = [], delivered = 0;
 const RETRYABLE = (st, body = "") => st === 408 || st === 429 || st >= 500 || /rate.?limit|too many|try again/i.test(body); // some webhook hosts send rate limits as 400
 function redact(s) { // never let the webhook URL or header values reach the log
-  s = String(s || ""); const secrets = [C && C.url, ...Object.values((C && C.headers) || {}).flatMap((v) => [v, ...String(v).split(/\s+/)])].filter((v) => v && String(v).length > 7);
+  s = String(s || ""); const hs = [(C && C.headers) || {}, ...((C && C.subscribers) || []).map((x) => x.headers || {})];
+  const secrets = [C && C.url, ...((C && C.subscribers) || []).map((x) => x.url), ...hs.flatMap((h) => Object.values(h)).flatMap((v) => [v, ...String(v).split(/\s+/)])].filter((v) => v && String(v).length > 7);
   for (const v of secrets.sort((a, b) => String(b).length - String(a).length)) s = s.split(String(v)).join("[redacted]");
   return s.replace(/\s+/g, " ").trim().slice(0, 500);
 }
-async function post(e) { // one attempt; returns { ok, status, body, retry }
+async function post(e, sub = subsList()[0]) { // one attempt to one subscriber; returns { ok, status, body, retry }
   try {
-    const r = await fetch(C.url, { method: "POST", headers: { "content-type": "application/json", "user-agent": "t3listen", ...C.headers }, body: JSON.stringify(e), signal: AbortSignal.timeout(20000) });
+    const r = await fetch(sub.url, { method: "POST", headers: { "content-type": "application/json", "user-agent": "t3listen", ...sub.headers }, body: JSON.stringify(e), signal: AbortSignal.timeout(20000) });
     if (r.ok) return { ok: true, status: r.status };
     let body = ""; try { body = await r.text(); } catch {}
     return { ok: false, status: r.status, body: redact(body), retry: RETRYABLE(r.status, body) };
@@ -160,29 +228,59 @@ function markDelivered(e) {
   if (e.event === "request.opened") s.delivered = true; else if (e.event === "request.resolved" && s.closing) delete S.sent[e.requestId];
   saveState();
 }
+// per-subscriber bookkeeping: an event counts as delivered once every matching subscriber got it; with subscribers, the
+// state record keeps sentTo/closedTo names so a restart resends only to the ones that missed it
+const outstanding = new Map(); // eventId -> Set of subscriber names still to get it
+function sentRec(e) { if (e.runId && !e.requestId) { const f = S.finished[e.runId]; return f && f.e && f.e.turnState === e.turnState ? f : null; } return S.sent[e.requestId] || null; }
+const sentKey = (e) => (e.event === "request.resolved" ? "closedTo" : "sentTo");
+function noteSent(e, name) {
+  const left = outstanding.get(e.eventId); if (left) left.delete(name);
+  if (C.multi) { const r = sentRec(e); if (r) { const k = sentKey(e); r[k] = [...new Set([...(r[k] || []), name])]; saveState(); } }
+  if (!left || !left.size) { outstanding.delete(e.eventId); markDelivered(e); }
+}
+function routeInfo(e) { // what subscriber rules look at, from the live shell when known
+  const t = meta.threads.get(e.threadId) || {}, pid = t.lineage && t.lineage.parentThreadId, par = pid ? meta.threads.get(pid) : null;
+  const of = (x, title) => ({ threadId: x.id, title: clean(title ?? x.title ?? ""), branch: x.branch ?? null, project: meta.projects.get(x.projectId) ?? null });
+  const self = { ...of({ ...t, id: e.threadId }, e.title), ...(e.project != null ? { project: e.project } : {}) };
+  return { self, parent: par ? of(par) : null, delegated: !!(e.delegated || String(e.threadId || "").startsWith(DELEGATED)) };
+}
+// a hand-built C (tests, older callers) without a subscribers list acts as the single legacy webhook
+const subsList = () => C.subscribers || [{ name: "default", url: C.url, headers: C.headers || {}, watch: C.watch || [], delegated: "failed", delegatedMatch: "self", enabled: true, include: null, exclude: null, legacy: true }];
+const payloadFor = (sub, e) => (C.multi ? { ...e, subscriber: sub.name } : e);
 async function deliver(e) {
-  if (!C.watch.includes(e.turnState || (e.requestId ? "waiting-user" : END_STATE[e.event] || "final"))) return true;
+  if (!C.watch.includes(stateOf(e))) return true;
   cleanEvent(e); e.text = summary(e); e.sentAt = new Date().toISOString(); e.eventId = crypto.createHash("sha256").update(`${e.event}|${ref(e)}${e.runId && MID_STATES.has(e.turnState) ? "|" + e.turnState : ""}`).digest("hex").slice(0, 16);
+  const rec = C.multi ? sentRec(e) : null, done = new Set((rec && rec[sentKey(e)]) || []);
+  const subs = routeFor(subsList(), e, routeInfo(e)).filter((x) => !done.has(x.name));
+  if (C.multi && (DRY || VERBOSE)) log(`route ${e.event} "${e.title}" -> ${subs.map((x) => x.name).join(",") || "(no subscriber)"}`);
+  if (!subs.length) { if (!DRY) markDelivered(e); return true; }
   if (DRY) { log("DRY-RUN payload " + JSON.stringify(e)); delivered++; return true; }
+  outstanding.set(e.eventId, new Set(subs.map((x) => x.name)));
+  let all = true;
+  for (const sub of subs) if (!(await deliverTo(sub, e))) all = false;
+  return all;
+}
+async function deliverTo(sub, e) {
+  const tag = C.multi ? ` [${sub.name}]` : "";
   for (let i = 0; i < 3; i++) {
-    const r = await post(e);
-    if (r.ok) { log(`sent ${e.event} "${e.title}" ${ref(e).slice(-12)}${e.event === "request.resolved" ? ` answeredHere=${e.answeredHere}` : ""} -> HTTP ${r.status}`); delivered++; markDelivered(e); return true; }
-    if (r.status) log(`webhook answered HTTP ${r.status} for ${e.event} ${ref(e).slice(-12)}${r.status === 401 || r.status === 403 ? " (check the key in listen.json)" : ""}${r.body ? `: ${r.body}` : ""}`);
-    else log(`webhook not reachable (${r.body})`);
+    const r = await post(payloadFor(sub, e), sub);
+    if (r.ok) { log(`sent ${e.event} "${e.title}" ${ref(e).slice(-12)}${e.event === "request.resolved" ? ` answeredHere=${e.answeredHere}` : ""} -> HTTP ${r.status}${tag}`); delivered++; noteSent(e, sub.name); return true; }
+    if (r.status) log(`webhook${tag} answered HTTP ${r.status} for ${e.event} ${ref(e).slice(-12)}${r.status === 401 || r.status === 403 ? " (check the key in listen.json)" : ""}${r.body ? `: ${r.body}` : ""}`);
+    else log(`webhook${tag} not reachable (${r.body})`);
     if (!r.retry) break; if (i < 2) await sleep((/rate.?limit/i.test(r.body || "") ? 20000 : 2000) * 3 ** i);
   }
   // keep it queued and retry every 60s: retryable failures (network, 408, 429, 5xx) for up to 24h, other 4xx 10 times
-  if (queue.length < 100) queue.push({ e, rounds: 0, since: Date.now() }); return false;
+  if (queue.length < 100) queue.push({ e, sub, rounds: 0, since: Date.now() }); return false;
 }
 setInterval(async () => {
   if (!queue.length) return; const q = queue; queue = [];
   for (const item of q) {
-    const { e } = item; item.rounds++; e.sentAt = new Date().toISOString();
-    const r = await post(e);
-    if (r.ok) { log(`sent ${e.event} "${e.title}" ${ref(e).slice(-12)}${e.event === "request.resolved" ? ` answeredHere=${e.answeredHere}` : ""} -> HTTP ${r.status} (retry ${item.rounds})`); delivered++; markDelivered(e); continue; }
-    log(`retry ${item.rounds}: ${r.status ? `webhook answered HTTP ${r.status}` : `webhook not reachable (${r.body})`} for ${e.event} ${ref(e).slice(-12)}${r.status && r.body ? `: ${r.body}` : ""}`);
+    const { e } = item, sub = item.sub || subsList()[0], tag = C.multi ? ` [${sub.name}]` : ""; item.rounds++; e.sentAt = new Date().toISOString();
+    const r = await post(payloadFor(sub, e), sub);
+    if (r.ok) { log(`sent ${e.event} "${e.title}" ${ref(e).slice(-12)}${e.event === "request.resolved" ? ` answeredHere=${e.answeredHere}` : ""} -> HTTP ${r.status} (retry ${item.rounds})${tag}`); delivered++; noteSent(e, sub.name); continue; }
+    log(`retry ${item.rounds}${tag}: ${r.status ? `webhook answered HTTP ${r.status}` : `webhook not reachable (${r.body})`} for ${e.event} ${ref(e).slice(-12)}${r.status && r.body ? `: ${r.body}` : ""}`);
     if (r.retry ? Date.now() - item.since < 864e5 : item.rounds < 10) { if (queue.length < 100) queue.push(item); }
-    else log(`giving up on ${e.event} ${ref(e).slice(-12)} after ${item.rounds} retries; it is tried again when the listener restarts`);
+    else log(`giving up on ${e.event} ${ref(e).slice(-12)}${tag} after ${item.rounds} retries; it is tried again when the listener restarts`);
   }
 }, 60000).unref();
 
@@ -206,7 +304,7 @@ async function reconcile(ep, threadId, opts = {}) {
     if (!C.watch.includes("waiting-user")) continue;
     const e = { event: "request.opened", ...base, ...requestInfo(p, r), ...turnDetails(t, p, [...meta.threads.values()]), turnState: "waiting-user" };
     if (e.questions && !e.questions.length) e.note = "question details not readable; answer it in T3";
-    S.sent[r.id] = { threadId, at: (S.sent[r.id] && S.sent[r.id].at) || Date.now(), delivered: false }; saveState(); await deliver(e);
+    S.sent[r.id] = { ...(S.sent[r.id] || {}), threadId, at: (S.sent[r.id] && S.sent[r.id].at) || Date.now(), delivered: false }; saveState(); await deliver(e);
   }
   for (const [id, s] of Object.entries(S.sent)) {
     if (s.threadId !== threadId || open.some((r) => r.id === id)) continue;
@@ -281,7 +379,7 @@ async function buildEnd(ep, t, runId, opts = {}) { // -> { e } or { skip: reason
   catch (err) { return { skip: `couldn't read shell: ${err.message}` }; }
   t = (sh.threads || []).find((x) => x.id === t.id) || t; // projection/thread.updated may trail a new run
   const delegated = t.id.startsWith(DELEGATED);
-  if (delegated && event !== "thread.failed") return { skip: "sub-task thread that didn't fail" };
+  if (delegated && event !== "thread.failed" && !(C.subscribers || []).some((x) => x.enabled && x.delegated === "all")) return { skip: "sub-task thread that didn't fail" };
   if (event !== "thread.failed" && isBusy(t) && !opts.preview) return { skip: "thread is going on with its next queued message" };
   const details = turnDetails(t, p, sh.threads || [], event);
   if (!details.turnState) return { skip: "thread is going on with its next queued message" };
@@ -521,7 +619,7 @@ async function run() {
     S = readJSON(STATE, { sent: {} }); S.sent = S.sent || {}; S.finished = S.finished || {}; S.deferred = S.deferred || {};
   }
   for (const s of ["SIGINT", "SIGTERM"]) process.on(s, () => process.exit(0));
-  log(`t3listen started${DRY ? " (dry run: payloads are printed, nothing is sent)" : ""}; machine "${C.machine}", approvals ${C.approvals ? "on" : "off"}, watch ${C.watch.join(",") || "(none)"}`);
+  log(`t3listen started${DRY ? " (dry run: payloads are printed, nothing is sent)" : ""}; machine "${C.machine}", approvals ${C.approvals ? "on" : "off"}, watch ${C.watch.join(",") || "(none)"}${C.multi ? `, subscribers ${C.subscribers.filter((x) => x.enabled).map((x) => x.name).join(",") || "(none)"}` : ""}`);
   if (ONCE) { const t0 = Date.now(), limit = (+(optv("--timeout")) || 600) * 1000; setInterval(() => { if (delivered > 0) process.exit(0); if (Date.now() - t0 > limit) { log("--once: nothing happened before the timeout"); process.exit(2); } }, 500); }
   let delay = 2000, warned = "";
   for (;;) {
@@ -612,14 +710,116 @@ function status() {
   if (!running) { const p = +(fs.existsSync(PID) && fs.readFileSync(PID, "utf8")); if (p) try { process.kill(p, 0); running = true; pid = p; } catch {} }
   const st = readJSON(STATE, { sent: {} }), open = Object.values(st.sent || {}).filter((s) => !s.skipped).length;
   let tail = ""; try { tail = fs.readFileSync(LOG, "utf8").trim().split("\n").slice(-3).join("\n"); } catch {}
-  console.log(`autostart: ${inst}\nrunning: ${running ? `yes (pid ${pid})` : "no"}\nconfig: ${fs.existsSync(CONF) ? "listen.json present" : "no listen.json yet"}\napprovals: ${approvalsLine(readJSON(CONF, {}).approvals === true, /--approvals\b/.test(serviceArgs()))}\nopen questions sent: ${open}${tail ? `\nlast log lines:\n${tail}` : ""}`);
+  console.log(`autostart: ${inst}\nrunning: ${running ? `yes (pid ${pid})` : "no"}\nconfig: ${fs.existsSync(CONF) ? "listen.json present" : "no listen.json yet"}${Array.isArray(readJSON(CONF, {}).subscribers) ? `\nsubscribers: ${readJSON(CONF, {}).subscribers.map((x) => x && x.name).join(", ") || "(none)"}` : ""}\napprovals: ${approvalsLine(readJSON(CONF, {}).approvals === true, /--approvals\b/.test(serviceArgs()))}\nopen questions sent: ${open}${tail ? `\nlast log lines:\n${tail}` : ""}`);
 }
-async function test() {
-  C = loadConfig(); const e = { event: "test", machine: C.machine, threadId: "test", title: "t3listen test", project: null, requestId: "test-" + Date.now(), kind: "test" };
-  if (DRY) { console.log("DRY-RUN payload " + JSON.stringify({ ...e, text: `t3listen test from ${C.machine}` })); return; }
-  const r = await post({ ...e, text: `t3listen test from ${C.machine}: the webhook works`, sentAt: new Date().toISOString() });
-  if (!r.ok) die(r.status ? "WEBHOOK_REJECTED" : "WEBHOOK_UNREACHABLE", r.status ? `HTTP ${r.status}${r.status === 401 || r.status === 403 ? " (check the key)" : ""}${r.body ? `: ${r.body}` : ""}` : r.body);
-  console.log(`OK: webhook answered HTTP ${r.status}`);
+async function test() { // one event flagged test:true to every subscriber (or --subscriber name); ignores watch and match rules
+  C = loadConfig(); const only = optv("--subscriber"), subs = C.subscribers.filter((x) => x.enabled && (!only || x.name === only));
+  if (only && !subs.length) die("NO_SUBSCRIBER", `no enabled subscriber named "${only}"`);
+  const e = { event: "test", test: true, machine: C.machine, threadId: "test", title: "t3listen test", project: null, requestId: "test-" + Date.now(), kind: "test" };
+  if (DRY) { console.log("DRY-RUN payload " + JSON.stringify({ ...e, text: `t3listen test from ${C.machine}` })); if (C.multi) console.log(`would send to: ${subs.map((x) => x.name).join(", ") || "(none)"}`); return; }
+  let bad = 0;
+  for (const sub of subs) {
+    const r = await post({ ...payloadFor(sub, e), text: `t3listen test from ${C.machine}: the webhook works`, sentAt: new Date().toISOString() }, sub);
+    const why = r.status ? `HTTP ${r.status}${r.status === 401 || r.status === 403 ? " (check the key)" : ""}${r.body ? `: ${r.body}` : ""}` : r.body;
+    if (!C.multi) { if (!r.ok) die(r.status ? "WEBHOOK_REJECTED" : "WEBHOOK_UNREACHABLE", why); console.log(`OK: webhook answered HTTP ${r.status}`); continue; }
+    if (r.ok) console.log(`OK ${sub.name}: webhook answered HTTP ${r.status}`); else { bad++; console.error(`${r.status ? "WEBHOOK_REJECTED" : "WEBHOOK_UNREACHABLE"} ${sub.name}: ${why}`); }
+  }
+  if (bad) process.exit(1);
+}
+
+// ---------- subscriber commands (never print URLs or header values) ----------
+function writeConf(c) { const tmp = CONF + ".part"; fs.writeFileSync(tmp, JSON.stringify(c, null, 1) + "\n", { mode: 0o600 }); fs.renameSync(tmp, CONF); lockDown(CONF); }
+function readHookFile(f) { // JSON {url, headers} or setup's format: the webhook URL line, then 'Name: value' header lines
+  let txt; try { txt = fs.readFileSync(f, "utf8"); } catch (err) { die("BAD_URL_FILE", `can't read the url file (${err.code})`); }
+  if (/^\s*\{/.test(txt)) { let j; try { j = JSON.parse(txt); } catch { die("BAD_URL_FILE", "the url file looks like JSON but doesn't parse"); }
+    if (!okUrl(j.url)) die("BAD_URL", "the url file's url must start with https://"); return { url: j.url, headers: j.headers || {} }; }
+  let url = ""; const headers = {};
+  for (let l of txt.split(/\r?\n/)) {
+    l = l.trim().replace(/^POST\s+/i, ""); if (!l) continue;
+    const m = l.match(/^([A-Za-z0-9-]+):\s*(.+)$/);
+    if (!url && okUrl(l)) url = l; else if (m && /^(webhook-?)?url$/i.test(m[1]) && !url && okUrl(m[2].trim())) url = m[2].trim();
+    else if (m && !/^https?$/i.test(m[1])) headers[m[1]] = m[2]; else die("BAD_URL_FILE", "the url file must be the webhook URL (https://...) then optional 'Name: value' header lines");
+  }
+  if (!url) die("BAD_URL", "no https:// webhook URL in the url file"); return { url, headers };
+}
+const RULE_FLAGS = { "title-prefix": "titlePrefix", "title-regex": "titleRegex", branch: "branch", thread: "threadId", project: "project" };
+const describeRules = (r) => Object.entries(r || {}).map(([k, v]) => `${k} ${JSON.stringify(asList(v))}`).join("; ");
+function describeSub(x, defWatch) {
+  const w = x.watch === undefined ? `${defWatch.join(",")} (default)` : (typeof x.watch === "string" ? splitList(x.watch) : x.watch).join(",") || "(none)";
+  const m = x.match || {}, lines = [`${x.name}${x.enabled === false ? " (disabled)" : ""}: url ${x.url ? "set" : "MISSING"}, ${Object.keys(x.headers || {}).length} header(s); watch ${w}; sub-tasks ${x.delegated || "failed"} (matched by ${x.delegatedMatch || "parent"})`];
+  if (m.include && describeRules(m.include)) lines.push(`  include: ${describeRules(m.include)}`);
+  if (m.exclude && describeRules(m.exclude)) lines.push(`  exclude: ${describeRules(m.exclude)}`);
+  if (lines.length === 1) lines.push("  match: every thread");
+  return lines.join("\n");
+}
+function subscribe() {
+  const name = argv[1]; if (!name || name.startsWith("--") || !SUB_NAME.test(name)) die("USAGE", "subscribe <name> --url-file <path> [--include-title-prefix X ...] [--exclude-branch glob ...] [--watch a,b]");
+  const c = readJSON(CONF, null); if (!c && fs.existsSync(CONF)) die("BAD_LISTEN_CONFIG", "listen.json is unreadable; subscribe changed nothing");
+  const conf = c || {}, legacy = !Array.isArray(conf.subscribers), out = { ...conf }, notes = [];
+  const subs = legacy ? [] : conf.subscribers.map((x) => ({ ...x })), file = optv("--url-file"), fromCurrent = flag("--from-current");
+  if (fromCurrent && !conf.url) die("NO_CURRENT_URL", "--from-current needs the single top-level webhook in listen.json (it was already moved into a subscriber?)");
+  if (legacy && conf.url && !fromCurrent) { subs.push({ name: "default", url: conf.url, headers: conf.headers || {} }); notes.push('the existing webhook keeps every event as subscriber "default"'); }
+  if (legacy || fromCurrent) { delete out.url; delete out.headers; }
+  let sub = subs.find((x) => x.name === name); const isNew = !sub;
+  if (isNew && !file && !fromCurrent) die("USAGE", `new subscriber "${name}" needs --url-file <path> (or --from-current to move the single webhook)`);
+  if (isNew) { sub = { name }; subs.push(sub); }
+  if (file) Object.assign(sub, readHookFile(file)); else if (fromCurrent) Object.assign(sub, { url: conf.url, headers: conf.headers || {} });
+  const keyFile = optv("--key-file"); // the sender key alone: sent as "Authorization: Bearer <key>" (or as-is under --key-header Name)
+  if (keyFile) {
+    let key = ""; try { key = fs.readFileSync(keyFile, "utf8").trim(); } catch (err) { die("BAD_KEY_FILE", `can't read the key file (${err.code})`); }
+    const hname = optv("--key-header") || "Authorization"; if (!/^[A-Za-z0-9-]+$/.test(hname)) die("USAGE", "--key-header must be a header name");
+    key = key.replace(new RegExp(`^${hname}:\\s*`, "i"), "");
+    if (!key || /[\r\n]/.test(key)) die("BAD_KEY_FILE", "the key file must hold one line: the sender key");
+    sub.headers = { ...(sub.headers || {}), [hname]: /^authorization$/i.test(hname) && !/^(bearer|basic|token)\s/i.test(key) ? `Bearer ${key}` : key };
+  }
+  const match = { include: {}, exclude: {} }; let any = false;
+  for (const side of ["include", "exclude"]) for (const [f, k] of Object.entries(RULE_FLAGS)) { const v = optAll(`--${side}-${f}`); if (v.length) { match[side][k] = v; any = true; } }
+  if (any || flag("--clear-rules")) { sub.match = {}; for (const side of ["include", "exclude"]) if (Object.keys(match[side]).length) sub.match[side] = match[side]; if (!Object.keys(sub.match).length) delete sub.match; }
+  const wi = argv.findIndex((a) => a === "--watch" || a.startsWith("--watch="));
+  if (wi >= 0) { const v = argv[wi].includes("=") ? argv[wi].slice(8) : argv[wi + 1] && !argv[wi + 1].startsWith("--") ? argv[wi + 1] : ""; sub.watch = watchList(splitList(v)); }
+  if (flag("--default-watch")) delete sub.watch;
+  for (const [f, k] of [["--delegated", "delegated"], ["--delegated-match", "delegatedMatch"]]) { const v = optv(f); if (v !== undefined) sub[k] = v; }
+  if (flag("--disable")) sub.enabled = false; if (flag("--enable")) delete sub.enabled;
+  out.subscribers = subs; configFrom(out, { dry: true }); // validates rules, regexes, watch and names before anything is written
+  if (!DRY) writeConf(out);
+  console.log(`${DRY ? "would save" : "saved"} subscriber ${describeSub(sub, watchList(out.watch))}${notes.length ? `\nnote: ${notes.join("; ")}` : ""}${DRY ? "" : `\nRestart the listener to apply: node "${path.join(DIR, "t3listen")}" install`}`);
+}
+function unsubscribe() {
+  const name = argv[1], c = readJSON(CONF, null);
+  if (!c || !Array.isArray(c.subscribers)) die("NO_SUBSCRIBERS", "listen.json has no subscribers list");
+  if (!c.subscribers.some((x) => x && x.name === name)) die("NOT_FOUND", `no subscriber named "${name}" (have: ${c.subscribers.map((x) => x && x.name).join(", ") || "none"})`);
+  const out = { ...c, subscribers: c.subscribers.filter((x) => x && x.name !== name) };
+  if (!DRY) writeConf(out);
+  console.log(`${DRY ? "would remove" : "removed"} subscriber "${name}"; left: ${out.subscribers.map((x) => x.name).join(", ") || "(none: no events are sent)"}${DRY ? "" : " (restart the listener to apply)"}`);
+}
+function subscribers() {
+  const c = readJSON(CONF, null); if (!c) die("NO_LISTEN_CONFIG", "no readable listen.json");
+  const defWatch = watchList(c.watch);
+  if (!Array.isArray(c.subscribers)) { console.log(`no subscribers list: every event goes to the single webhook (url ${c.url ? "set" : "MISSING"}, ${Object.keys(c.headers || {}).length} header(s); watch ${defWatch.join(",") || "(none)"})`); return; }
+  console.log(c.subscribers.length ? c.subscribers.map((x) => describeSub(x, defWatch)).join("\n") : "subscribers list is empty: no events are sent");
+}
+async function route() { // which subscribers would get a thread's events; reads T3 (or a made-up thread), sends nothing
+  C = loadConfig(); const state = optv("--state") || "final", event = optv("--event") || (state === "failed" ? "thread.failed" : state === "cancelled" ? "thread.cancelled" : "thread.finished");
+  const names = (e, info) => routeFor(C.subscribers, e, info).map((x) => x.name).join(",") || "(none)";
+  if (["--title", "--branch", "--thread-id", "--project"].some((f) => optv(f) !== undefined)) {
+    const self = { threadId: optv("--thread-id") || "synthetic", title: optv("--title") || "", branch: optv("--branch") ?? null, project: optv("--project") ?? null };
+    const info = { self, parent: null, delegated: flag("--delegated") || self.threadId.startsWith(DELEGATED) };
+    console.log(`${state}: ${names({ event, turnState: state, threadId: self.threadId }, info)}`); return;
+  }
+  const ep = endpoint(); if (!ep) die("NO_T3", "T3 Code isn't running here");
+  let sh = {}; try { const r = await fetch(`${ep.base}/api/orchestration/shell`, { headers: ep.H }); if (!r.ok) throw new Error(`HTTP ${r.status}`); sh = await r.json(); } catch (err) { die("NO_T3", `couldn't read T3: ${err.message}`); }
+  for (const pr of sh.projects || []) meta.projects.set(pr.id, pr.title);
+  for (const t of sh.threads || []) meta.threads.set(t.id, t);
+  const q = optv("--thread"); let list = sh.threads || [];
+  if (q) { try { list = [pickThread([...(sh.threads || []), ...(sh.archivedThreads || [])], q)]; } catch (err) { const [w, ...rest] = err.message.split(": "); die(w, rest.join(": ")); } meta.threads.set(list[0].id, list[0]); }
+  const counts = Object.fromEntries(C.subscribers.map((x) => [x.name, 0])); let none = 0; const rows = [];
+  for (const t of list) {
+    const e = { event, turnState: state, threadId: t.id, title: clean(t.title || t.id), delegated: t.id.startsWith(DELEGATED) }, got = routeFor(C.subscribers, e, routeInfo(e));
+    for (const x of got) counts[x.name]++; if (!got.length) none++;
+    rows.push(`${(got.map((x) => x.name).join(",") || "-").padEnd(18)} ${trim(e.title, 70)}${t.branch ? `  [${t.branch}]` : ""}`);
+  }
+  if (q || flag("--list")) console.log(rows.join("\n"));
+  console.log(`${state} events from ${list.length} live thread(s): ${Object.entries(counts).map(([n, k]) => `${n} ${k}`).join(", ")}, none ${none}`);
 }
 
 async function previewFinish() { // print the run-end event the listener would send for a thread's latest ended run; posts nothing, saves nothing
@@ -661,7 +861,13 @@ const USAGE = `t3listen [run] [--dry-run] [--once [--timeout s]] [--approvals] [
 t3listen setup [--machine name]   read the webhook URL (line 1) and 'Name: value' header lines from stdin into listen.json (private)
 t3listen test [--dry-run]         send one test event to the webhook
 t3listen watch [final,waiting-user,failed,cancelled,waiting-subagents,waiting-command]   print or set states to POST (restart to apply; an empty string watches none)
+t3listen subscribe <name> --url-file <path> [--key-file <path> [--key-header Name]] | --from-current [--include-title-prefix X] [--include-title-regex RE] [--include-branch glob] [--include-thread id] [--include-project P]
+                 [--exclude-... same] [--clear-rules] [--watch a,b | --default-watch] [--delegated failed|all|none] [--delegated-match parent|self] [--disable|--enable]
+                                  add or update one webhook subscriber (repeat flags for several values; restart to apply)
+t3listen unsubscribe <name> | subscribers   remove one / list names, watch and match rules (URLs never printed)
+t3listen route [--thread id|title | --title T --branch B --project P --thread-id ID --delegated] [--state final] [--list]   which subscribers would get it (sends nothing)
+t3listen test [--subscriber name]   send one test event (test: true) to every subscriber, or one
 t3listen preview-finish --thread id|title   print the run-end event for a thread's latest ended run (sends nothing)
 t3listen install [--approvals] | uninstall | status   start at login (macOS LaunchAgent, Windows logon task, Linux systemd --user)`;
-if (require.main !== module) module.exports = { watchList, turnDetails, pickThread, idLike, systemdUnit, localTime, approvalsLine, staleMinutes, RED, clean, cleanEvent, summary, requestInfo, endedAt, tickLastAlive, catchUpThreads, afterSnapshotListen, usageLimitFields, shellReadyToArm, canArmResume };
-else ({ run, setup, watch: async () => watch(), test, "preview-finish": previewFinish, install: async () => install(), uninstall: async () => uninstall(), status: async () => status() }[cmd] || (async () => console.log(USAGE)))().catch((e) => { console.error("error:", e.message); process.exit(1); });
+if (require.main !== module) module.exports = { watchList, turnDetails, pickThread, idLike, systemdUnit, localTime, configFrom, routeFor, rulesHit, compileRules, globRe, threadMatches, approvalsLine, staleMinutes, RED, clean, cleanEvent, summary, requestInfo, endedAt, tickLastAlive, catchUpThreads, afterSnapshotListen, usageLimitFields, shellReadyToArm, canArmResume };
+else ({ run, setup, watch: async () => watch(), test, "preview-finish": previewFinish, subscribe: async () => subscribe(), unsubscribe: async () => unsubscribe(), subscribers: async () => subscribers(), route, install: async () => install(), uninstall: async () => uninstall(), status: async () => status() }[cmd] || (async () => console.log(USAGE)))().catch((e) => { console.error("error:", e.message); process.exit(1); });

@@ -77,6 +77,38 @@ Events add `turnState` without changing their existing names. By default, `liste
 
 Queued messages, including a held queue, prevent a final notification. Filtered mid-job turns remain eligible for a later final, with deferred run IDs saved across restarts. The listener rereads the live shell before reporting and rechecks deferred parents on parent/child updates. Only the latest successful turn can be final; an earlier turn does not consume a follow-up turn's notification. Repeated run/state events are deduplicated for 14 days, with distinct `eventId`s for opt-in interim states. Webhook retries reuse the same ID, so receivers should deduplicate it too. `preview-finish` prints the classification even if the watch list filters it; it sends nothing.
 
+### Several webhooks: subscribers
+
+`listen.json` can hold a `subscribers` list instead of the single `url`. Each subscriber is its own webhook with its own `watch` list and thread rules, and one thread can match several subscribers. Each POST adds `"subscriber": "<name>"`. With no `subscribers` key the listener works as before, with one `url`, `headers` and `watch`.
+
+```json
+{ "watch": ["final","waiting-user","failed","cancelled"],
+  "subscribers": [
+    { "name": "dev", "url": "https://...", "headers": { "Authorization": "Bearer ..." },
+      "match": { "exclude": { "titlePrefix": ["SHORTS-"], "titleRegex": ["\\b(trailers?|devlogs?|clips?|posting|social)\\b"], "branch": ["t3/shorts-*", "t3/trailer-*"] } } },
+    { "name": "marketing", "url": "https://...", "watch": "final,waiting-user,failed,cancelled", "delegated": "failed",
+      "match": { "include": { "titlePrefix": ["SHORTS-"], "branch": ["t3/shorts-*", "t3/trailer-*"] } } } ] }
+```
+
+- Rules (under `include` or `exclude`): `titlePrefix` (not case-sensitive), `titleRegex` (`"text"` is not case-sensitive, or use `"/re/flags"`), `branch` (glob, `*` matches anything including `/`), `threadId` (glob) and `project` (glob, not case-sensitive). With `include`, a thread has to match at least one rule. Without `include`, every thread matches. Any `exclude` hit drops the thread.
+- `watch`: an array or a comma string. A subscriber without its own `watch` uses the top-level `watch`, which defaults to the standard set.
+- `delegated` controls sub-task threads: `"failed"` (the default, same as before: their run ends only when they fail; their questions still go out), `"all"`, or `"none"` (nothing from sub-task threads). `delegatedMatch`: `"parent"` (the default) matches a sub-task thread by its parent thread's title, branch, id and project. `"self"` matches it by its own.
+- `"enabled": false` pauses a subscriber.
+
+Commands. Webhook URLs and header values are never printed. Restart the listener to apply a change (`install` again).
+
+```
+node t3listen subscribe dev --from-current --exclude-title-prefix SHORTS- --exclude-branch 't3/shorts-*'   # move the single webhook into a subscriber
+node t3listen subscribe marketing --url-file url.txt --key-file key.txt --include-title-prefix SHORTS- --include-branch 't3/shorts-*' --watch final,failed
+node t3listen subscribers            # names, watch lists and rules
+node t3listen unsubscribe marketing
+node t3listen route --thread "SHORTS-12"        # which subscribers would get this thread's events (sends nothing); no --thread: every live thread, --list for details
+node t3listen route --title "SHORTS-3 edit" --branch t3/foo
+node t3listen test --subscriber marketing       # one event flagged "test": true, to one subscriber (default: all of them)
+```
+
+`--url-file` takes the URL on line 1, optionally followed by `Name: value` header lines, or a JSON file `{"url","headers"}`. `--key-file` reads a single key and sends it as `Authorization: Bearer <key>`; to send it under another header as-is, add `--key-header Name`. Rule flags can be repeated: `--include-` or `--exclude-` followed by `title-prefix`, `title-regex`, `branch`, `thread` or `project`. Passing any rule flag replaces the subscriber's existing rules; `--clear-rules` removes them all. The first `subscribe` on a single-webhook config keeps the existing webhook as subscriber `"default"` (or moves it under a name of your choice with `--from-current`), so no events are lost. After a restart, each event is resent only to the subscribers that didn't get it.
+
 Setup, events, approvals, and autoresume: [t3-phone-answers](skills/t3-phone-answers/SKILL.md). Who may answer: [t3-tots-rules "Decisions"](skills/t3-tots-rules/SKILL.md).
 
 ## Delegated mode and approvals

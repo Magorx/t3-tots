@@ -337,3 +337,127 @@ test("preview-finish: usage-limit fields come from the ended run; armResume is n
   assert.equal(payload.autoResumeSet, false);
   assert.ok(!hits.some((h) => /dispatch|ws/i.test(h)), hits.join("\n"));
 });
+
+// ---------- subscribers: per-webhook routing ----------
+const SUBS = {
+  watch: ["final", "waiting-user", "failed", "cancelled"],
+  subscribers: [
+    { name: "dev", url: "https://example.invalid/dev", headers: { Authorization: "Bearer dev-secret-value" },
+      match: { exclude: { titlePrefix: ["SHORTS-"], titleRegex: ["\\b(trailers?|devlogs?|clips?|posting|social)\\b"], branch: ["t3/shorts-*", "t3/trailer-*"] } } },
+    { name: "marketing", url: "https://example.invalid/mkt", watch: "final,failed", delegated: "none",
+      match: { include: { titlePrefix: ["SHORTS-"], titleRegex: ["/^TRAILER/i"], branch: ["t3/shorts-*", "t3/trailer-*"] } } },
+    { name: "all", url: "https://example.invalid/all", delegated: "all", delegatedMatch: "self" },
+  ],
+};
+const info = (title, branch = null, extra = {}) => ({ self: { threadId: extra.threadId || "t-1", title, branch, project: extra.project ?? null }, parent: extra.parent || null, delegated: !!extra.delegated });
+const routed = (c, e, i) => l.routeFor(c.subscribers, { event: "thread.finished", turnState: "final", threadId: "t-1", ...e }, i).map((x) => x.name).join(",");
+
+test("subscribers: no list = the old single webhook, unchanged watch, every thread", () => {
+  const c = l.configFrom({ url: "https://example.invalid/x", headers: { A: "b" }, watch: ["final"] });
+  assert.equal(c.multi, false); assert.equal(c.subscribers.length, 1); assert.equal(c.subscribers[0].url, "https://example.invalid/x");
+  assert.deepEqual(c.watch, ["final"]);
+  assert.equal(routed(c, {}, info("SHORTS-anything", "t3/shorts-1")), "default");
+  assert.equal(routed(c, { turnState: "waiting-subagents" }, info("x")), "");
+  assert.throws(() => l.configFrom({ url: "http://example.com" }), /url must start with https/);
+});
+test("subscribers: include/exclude by title prefix, regex and branch glob; a thread can match several", () => {
+  const c = l.configFrom(SUBS);
+  assert.deepEqual(c.watch.sort(), ["cancelled", "failed", "final", "waiting-user"]);
+  assert.equal(routed(c, {}, info("Fix water mesh", "t3/fix-water-mesh")), "dev,all");
+  assert.equal(routed(c, {}, info("SHORTS-12 render", "t3/foo")), "marketing,all");
+  assert.equal(routed(c, {}, info("shorts-lowercase prefix")), "marketing,all"); // prefixes are case-insensitive
+  assert.equal(routed(c, {}, info("Edit the Clips for posting")), "all"); // dev excludes the words, marketing doesn't include them
+  assert.equal(routed(c, {}, info("Trailer cut v2")), "marketing,all");
+  assert.equal(routed(c, {}, info("Plain title", "t3/trailer-teaser")), "marketing,all");
+  assert.equal(routed(c, {}, info("Cliparts loader")), "dev,all"); // word boundary: "cliparts" isn't "clip"
+});
+test("subscribers: per-subscriber watch lists and test events", () => {
+  const c = l.configFrom(SUBS);
+  assert.equal(routed(c, { event: "request.opened", turnState: "waiting-user", requestId: "r" }, info("SHORTS-1")), "all"); // marketing watches final,failed only
+  assert.equal(routed(c, { event: "thread.failed", turnState: "failed" }, info("SHORTS-1")), "marketing,all");
+  assert.equal(routed(c, { event: "test", turnState: undefined, requestId: "test-1" }, info("t3listen test")), "dev,all");
+});
+test("subscribers: thread id and project rules (globs, project case-insensitive)", () => {
+  const c = l.configFrom({ subscribers: [{ name: "p", url: "https://e.invalid/1", match: { include: { project: ["water*"], threadId: ["thread:special:*"] } } }] });
+  assert.equal(routed(c, {}, info("x", null, { project: "Waterfall" })), "p");
+  assert.equal(routed(c, {}, info("x", null, { project: "Other" })), "");
+  assert.equal(routed(c, {}, info("x", null, { threadId: "thread:special:42" })), "p");
+});
+test("subscribers: delegated sub-task policy (failed default, all, none) and parent matching", () => {
+  const c = l.configFrom(SUBS), par = { threadId: "p-1", title: "SHORTS-7 render", branch: "t3/shorts-7", project: null };
+  const kid = (ev, st) => routed(c, { event: ev, turnState: st, threadId: "thread:delegated-task:k" }, info("Child step", null, { delegated: true, threadId: "thread:delegated-task:k", parent: par }));
+  assert.equal(kid("thread.finished", "final"), "all"); // dev: only failures; marketing: none; all: every event
+  assert.equal(kid("thread.failed", "failed"), "all"); // dev is matched by the SHORTS- parent and excludes it
+  const devParent = { ...par, title: "Physics refactor", branch: "t3/physics" };
+  assert.equal(routed(c, { event: "thread.failed", turnState: "failed" }, info("Child", null, { delegated: true, parent: devParent })), "dev,all");
+  const self = l.configFrom({ subscribers: [{ name: "s", url: "https://e.invalid/1", delegated: "all", delegatedMatch: "self", match: { include: { titlePrefix: ["Child"] } } }] });
+  assert.equal(routed(self, {}, info("Child step", null, { delegated: true, parent: devParent })), "s");
+});
+test("subscribers: bad configs fail with BAD_LISTEN_CONFIG", () => {
+  for (const [bad, re] of [
+    [{ subscribers: {} }, /must be an array/], [{ subscribers: [{ url: "https://e.invalid" }] }, /needs a "name"/],
+    [{ subscribers: [{ name: "a", url: "https://e.invalid" }, { name: "a", url: "https://e.invalid" }] }, /two subscribers are named "a"/],
+    [{ subscribers: [{ name: "a", url: "https://e.invalid", match: { include: { title: ["x"] } } }] }, /unknown rule "title"/],
+    [{ subscribers: [{ name: "a", url: "https://e.invalid", match: { include: { titleRegex: ["("] } } }] }, /bad titleRegex/],
+    [{ subscribers: [{ name: "a", url: "https://e.invalid", delegated: "some" }] }, /delegated must be one of/],
+    [{ subscribers: [{ name: "a", url: "https://e.invalid", watch: "final,nope" }] }, /watch must be/],
+    [{ subscribers: [{ name: "a", url: "ftp://e.invalid" }] }, /subscriber "a" url must start with https/],
+  ]) assert.throws(() => l.configFrom(bad), re);
+  assert.equal(l.configFrom({ subscribers: [] }).watch.length, 0); // empty list: nothing is sent
+});
+test("subscribers CLI: subscribe/unsubscribe/subscribers/route/test never print URLs or header values; test reaches each hook", async () => {
+  const fs = require("fs"), os = require("os"), http = require("http"), { execFile } = require("child_process");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "t3listen-subs-")), self = path.join(tmp, "t3listen");
+  fs.copyFileSync(path.join(__dirname, "..", "tools", "t3listen"), self);
+  const got = []; const srv = http.createServer((req, res) => { let b = ""; req.on("data", (d) => (b += d)); req.on("end", () => { got.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(b) }); res.end("ok"); }); });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${srv.address().port}`, devUrl = `${base}/dev-hook-SECRETPATH1`, mktUrl = `${base}/mkt-hook-SECRETPATH2`;
+  fs.writeFileSync(path.join(tmp, "listen.json"), JSON.stringify({ url: devUrl, headers: { Authorization: "Bearer devtokenvalue123" }, machine: "m", skipStaleMinutes: 1440 }));
+  fs.writeFileSync(path.join(tmp, "mkt.txt"), `${mktUrl}\nAuthorization: Bearer mkttokenvalue456\n`);
+  const run = (...a) => new Promise((done) => execFile(process.execPath, [self, ...a], (err, out, errOut) => done({ code: err ? err.code : 0, out: out + errOut })));
+  const all = [];
+  const r1 = await run("subscribe", "dev", "--from-current", "--exclude-title-prefix", "SHORTS-", "--exclude-title-regex", "\\b(trailer|clip)s?\\b", "--exclude-branch", "t3/shorts-*", "--exclude-branch", "t3/trailer-*"); all.push(r1);
+  assert.equal(r1.code, 0, r1.out);
+  let conf = JSON.parse(fs.readFileSync(path.join(tmp, "listen.json"), "utf8"));
+  assert.equal(conf.url, undefined); assert.equal(conf.subscribers[0].url, devUrl); assert.deepEqual(conf.subscribers[0].match.exclude.branch, ["t3/shorts-*", "t3/trailer-*"]);
+  if (process.platform !== "win32") assert.equal(fs.statSync(path.join(tmp, "listen.json")).mode & 0o777, 0o600);
+  const r2 = await run("subscribe", "marketing", "--url-file", path.join(tmp, "mkt.txt"), "--include-title-prefix", "SHORTS-", "--include-branch", "t3/shorts-*", "--watch", "final,failed"); all.push(r2);
+  assert.equal(r2.code, 0, r2.out);
+  conf = JSON.parse(fs.readFileSync(path.join(tmp, "listen.json"), "utf8"));
+  assert.deepEqual(conf.subscribers.map((x) => x.name), ["dev", "marketing"]); assert.equal(conf.subscribers[1].headers.Authorization, "Bearer mkttokenvalue456");
+  const r3 = await run("subscribers"); all.push(r3);
+  assert.match(r3.out, /dev: url set, 1 header\(s\)/); assert.match(r3.out, /marketing: .*watch final,failed/); assert.match(r3.out, /include: titlePrefix \["SHORTS-"\]/);
+  const r4 = await run("route", "--title", "SHORTS-3 edit"); all.push(r4); assert.match(r4.out, /final: marketing$/m);
+  const r5 = await run("route", "--title", "Water solver", "--branch", "t3/water"); all.push(r5); assert.match(r5.out, /final: dev$/m);
+  const r6 = await run("test"); all.push(r6); srv.close();
+  assert.equal(r6.code, 0, r6.out); assert.match(r6.out, /OK dev/); assert.match(r6.out, /OK marketing/);
+  assert.deepEqual(got.map((g) => [g.url.slice(1, 4), g.auth.split(" ")[1].slice(0, 3), g.body.subscriber, g.body.test]), [["dev", "dev", "dev", true], ["mkt", "mkt", "marketing", true]]);
+  const r7 = await run("unsubscribe", "marketing"); all.push(r7); assert.match(r7.out, /left: dev/);
+  const r8 = await run("subscribe", "x"); all.push(r8); assert.notEqual(r8.code, 0); assert.match(r8.out, /needs --url-file/);
+  for (const r of all) for (const bad of ["SECRETPATH", "devtokenvalue", "mkttokenvalue", "127.0.0.1"]) assert.ok(!r.out.includes(bad), `${bad} printed: ${r.out}`);
+});
+test("subscribers: first subscribe on a single-webhook config keeps that webhook as \"default\"", async () => {
+  const fs = require("fs"), os = require("os"), { execFileSync } = require("child_process");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "t3listen-subs-")), self = path.join(tmp, "t3listen");
+  fs.copyFileSync(path.join(__dirname, "..", "tools", "t3listen"), self);
+  fs.writeFileSync(path.join(tmp, "listen.json"), JSON.stringify({ url: "https://example.invalid/old", headers: {}, watch: ["final"] }));
+  fs.writeFileSync(path.join(tmp, "new.json"), JSON.stringify({ url: "https://example.invalid/new", headers: { "X-Key": "abcdefgh12345" } }));
+  const out = execFileSync(process.execPath, [self, "subscribe", "new", "--url-file", path.join(tmp, "new.json"), "--include-thread", "thread:x:*"]).toString();
+  assert.match(out, /subscriber "default"/); assert.ok(!out.includes("example.invalid") && !out.includes("abcdefgh"));
+  const c = JSON.parse(fs.readFileSync(path.join(tmp, "listen.json"), "utf8"));
+  assert.deepEqual(c.subscribers.map((x) => [x.name, x.url]), [["default", "https://example.invalid/old"], ["new", "https://example.invalid/new"]]);
+  assert.deepEqual(c.watch, ["final"]); assert.equal(l.configFrom(c).subscribers[0].watch.join(), "final");
+});
+test("subscribers CLI: --key-file sends the key as Authorization: Bearer, never printed", () => {
+  const fs = require("fs"), os = require("os"), { execFileSync } = require("child_process");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "t3listen-subs-")), self = path.join(tmp, "t3listen");
+  fs.copyFileSync(path.join(__dirname, "..", "tools", "t3listen"), self);
+  fs.writeFileSync(path.join(tmp, "listen.json"), JSON.stringify({ subscribers: [] }));
+  fs.writeFileSync(path.join(tmp, "u.txt"), "https://example.invalid/hookpath\n"); fs.writeFileSync(path.join(tmp, "k.txt"), "rawkeyvalue987654321\n");
+  const out = execFileSync(process.execPath, [self, "subscribe", "m", "--url-file", path.join(tmp, "u.txt"), "--key-file", path.join(tmp, "k.txt")]).toString();
+  assert.ok(!/hookpath|rawkeyvalue/.test(out), out); assert.match(out, /1 header\(s\)/);
+  const c = JSON.parse(fs.readFileSync(path.join(tmp, "listen.json"), "utf8"));
+  assert.deepEqual(c.subscribers[0].headers, { Authorization: "Bearer rawkeyvalue987654321" });
+  execFileSync(process.execPath, [self, "subscribe", "m", "--key-file", path.join(tmp, "k.txt"), "--key-header", "X-Key"]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, "listen.json"), "utf8")).subscribers[0].headers["X-Key"], "rawkeyvalue987654321");
+});
