@@ -461,3 +461,78 @@ test("subscribers CLI: --key-file sends the key as Authorization: Bearer, never 
   execFileSync(process.execPath, [self, "subscribe", "m", "--key-file", path.join(tmp, "k.txt"), "--key-header", "X-Key"]);
   assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, "listen.json"), "utf8")).subscribers[0].headers["X-Key"], "rawkeyvalue987654321");
 });
+
+// ---------- thread ownership (routing.json) ----------
+const OWN = { subscribers: [{ name: "dev", url: "https://e.invalid/dev", default: true }, { name: "marketing", url: "https://e.invalid/mkt", default: false }] };
+const R = (owners = {}, mutes = {}) => ({ version: 1, owners, mutes });
+const go = (c, r, i, e = {}) => l.routeFor(c.subscribers, { event: "thread.finished", turnState: "final", threadId: i.self.threadId, ...e }, i, r).map((x) => x.name).join(",");
+test("ownership: owned threads go only to the owner; unowned to default subscribers; mutes; unknown owner falls back", () => {
+  const c = l.configFrom(OWN);
+  assert.equal(go(c, R(), info("SHORTS-1 render", "t3/shorts-1")), "dev"); // content rules are gone: unowned = default (dev)
+  assert.equal(go(c, R({ "t-1": { owner: "marketing" } }), info("SHORTS-1 render")), "marketing");
+  assert.equal(go(c, R({ "t-1": "dev" }), info("anything")), "dev");
+  assert.equal(go(c, R({ "t-1": { owner: "gone" } }), info("x")), "dev");
+  assert.equal(go(c, R({}, { dev: { "t-1": "2026" } }), info("x")), "");
+  assert.equal(go(c, R({ "t-1": { owner: "marketing" } }), info("x"), { event: "request.opened", turnState: "waiting-user", requestId: "r" }), "marketing");
+  const legacy = l.configFrom({ url: "https://e.invalid/x" }); assert.equal(go(legacy, R({ "t-1": { owner: "marketing" } }), info("x")), "default");
+  assert.throws(() => l.configFrom({ subscribers: [{ name: "a", url: "https://e.invalid", default: "yes" }] }), /default must be true or false/);
+});
+test("ownership: sub-task threads follow their parent's owner, failures only by default", () => {
+  const c = l.configFrom(OWN), par = { threadId: "p-1", title: "Render teaser", branch: null, project: null };
+  const kid = (r, ev, st) => go(c, r, info("Child step", null, { delegated: true, threadId: "thread:delegated-task:k", parent: par }), { event: ev, turnState: st });
+  assert.equal(kid(R({ "p-1": { owner: "marketing" } }), "thread.failed", "failed"), "marketing");
+  assert.equal(kid(R({ "p-1": { owner: "marketing" } }), "thread.finished", "final"), "");
+  assert.equal(kid(R(), "thread.failed", "failed"), "dev");
+  assert.equal(kid(R({ "p-1": { owner: "marketing" }, "thread:delegated-task:k": { owner: "dev" } }), "thread.failed", "failed"), "dev"); // its own claim wins
+  assert.equal(kid(R({}, { dev: { "p-1": "x" } }), "thread.failed", "failed"), ""); // muting the parent mutes its sub-tasks
+});
+function ownTmp() {
+  const fs = require("fs"), os = require("os"), tmp = fs.mkdtempSync(path.join(os.tmpdir(), "t3listen-own-"));
+  for (const f of ["t3listen", "t3ctl"]) fs.copyFileSync(path.join(__dirname, "..", "tools", f), path.join(tmp, f));
+  fs.writeFileSync(path.join(tmp, "listen.json"), JSON.stringify(OWN)); fs.mkdirSync(path.join(tmp, "not-t3"));
+  const env = { ...process.env, T3_HOME: path.join(tmp, "not-t3") }; delete env.T3_OWNER;
+  const run = (...a) => { const r = require("child_process").spawnSync(process.execPath, [path.join(tmp, "t3listen"), ...a], { env, encoding: "utf8" }); return { code: r.status, out: r.stdout + r.stderr }; };
+  return { tmp, env, run, routing: () => JSON.parse(fs.readFileSync(path.join(tmp, "routing.json"), "utf8")) };
+}
+test("ownership CLI: claim / owner / owners / release / mute, no T3 needed for ids, file is private", () => {
+  const fs = require("fs"), { tmp, run, routing } = ownTmp();
+  let r = run("claim", "thread:project:p:abc123", "marketing"); assert.equal(r.code, 0, r.out); assert.match(r.out, /claimed: thread:project:p:abc123 -> only marketing \(was unowned/);
+  assert.equal(routing().owners["thread:project:p:abc123"].owner, "marketing");
+  if (process.platform !== "win32") assert.equal(fs.statSync(path.join(tmp, "routing.json")).mode & 0o777, 0o600);
+  assert.match(run("claim", "thread:project:p:abc123", "marketing").out, /already owned/);
+  assert.match(run("claim", "thread:project:p:abc123", "nobody").out, /NO_SUBSCRIBER/);
+  r = run("owner", "thread:project:p:abc123"); assert.match(r.out, /owner: marketing/); assert.match(r.out, /final -> marketing; failed -> marketing/);
+  r = run("route", "--thread-id", "thread:project:p:abc123"); assert.match(r.out, /final: marketing {2}\(owner marketing\)/);
+  r = run("route", "--thread-id", "thread:project:p:other1"); assert.match(r.out, /^final: dev$/m);
+  r = run("owners"); assert.match(r.out, /owned threads: 1 \(marketing 1\)/); assert.match(r.out, /marketing .*thread:project:p:abc123/);
+  r = run("release", "thread:project:p:abc123"); assert.match(r.out, /released: .*\(was marketing\)/); assert.deepEqual(routing().owners, {});
+  assert.match(run("owner", "thread:project:p:abc123").out, /owner: none \(default: dev\)/);
+  run("mute", "thread:project:p:zz999999", "dev"); assert.ok(routing().mutes.dev["thread:project:p:zz999999"]);
+  assert.match(run("route", "--thread-id", "thread:project:p:zz999999").out, /final: \(none\)/);
+  run("unmute", "thread:project:p:zz999999", "dev"); assert.deepEqual(routing().mutes, {});
+  assert.match(run("claim", "two words title", "dev").out, /NO_T3/); // a title needs T3 to resolve; never guessed
+});
+test("ownership: concurrent claims from several processes all land; the listener re-reads without a restart", async () => {
+  const fs = require("fs"), { tmp, env, routing } = ownTmp(), { execFile } = require("child_process");
+  const lt = require(path.join(tmp, "t3listen")); assert.equal(Object.keys(lt.readRouting().owners).length, 0);
+  const ids = Array.from({ length: 16 }, (_, i) => `thread:project:p:conc${String(i).padStart(4, "0")}`);
+  const res = await Promise.all(ids.map((id, i) => new Promise((done) => execFile(process.execPath, [path.join(tmp, "t3listen"), "claim", id, i % 2 ? "dev" : "marketing", "--exact"], { env }, (err, out, e2) => done({ code: err ? err.code : 0, out: out + e2 })))));
+  for (const r of res) assert.equal(r.code, 0, r.out);
+  assert.equal(Object.keys(routing().owners).length, 16);
+  assert.equal(Object.keys(lt.readRouting().owners).length, 16); // same process, file changed underneath: picked up
+  assert.ok(!fs.readdirSync(tmp).some((f) => f.endsWith(".part") || f.endsWith(".lock")));
+  fs.writeFileSync(path.join(tmp, "routing.json"), "{ broken"); assert.equal(Object.keys(lt.readRouting().owners).length, 16); // keeps the last good copy
+  const bad = require("child_process").spawnSync(process.execPath, [path.join(tmp, "t3listen"), "claim", ids[0], "dev"], { env, encoding: "utf8" });
+  assert.notEqual(bad.status, 0); assert.match(bad.stderr, /BAD_ROUTING/); // never overwrites an unreadable file
+});
+test("ownership: t3ctl new/fork --owner (or T3_OWNER) claims the new thread through t3listen", () => {
+  const { tmp, routing } = ownTmp(), t3ctl = require(path.join(tmp, "t3ctl"));
+  assert.equal(t3ctl.ownerOf({}, {}), null); assert.equal(t3ctl.ownerOf({}, { T3_OWNER: "marketing" }), "marketing"); assert.equal(t3ctl.ownerOf({ owner: "dev" }, { T3_OWNER: "marketing" }), "dev");
+  const saved = process.env.T3_HOME; process.env.T3_HOME = path.join(tmp, "not-t3");
+  try {
+    assert.equal(t3ctl.claimOwner("thread:project:p:new00001", { owner: "marketing" }, "t3ctl new"), true);
+    assert.equal(t3ctl.claimOwner("thread:project:p:new00002", { owner: "nobody" }, "t3ctl new"), false);
+    assert.equal(t3ctl.claimOwner("thread:project:p:new00003", {}, "t3ctl new"), null);
+  } finally { if (saved === undefined) delete process.env.T3_HOME; else process.env.T3_HOME = saved; }
+  const o = routing().owners; assert.deepEqual(Object.keys(o), ["thread:project:p:new00001"]); assert.equal(o["thread:project:p:new00001"].by, "t3ctl new");
+});

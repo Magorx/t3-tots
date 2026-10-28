@@ -18,7 +18,7 @@ Follow the t3-tots-rules skill (skills/t3-tots-rules/SKILL.md). Find the thread 
 | List sub-tasks, stop one Claude subagent | `t3ctl subtasks --thread '<t>'`, `t3ctl subagent-stop --thread '<t>' --subagent <id>` |
 | Snooze | `t3ctl snooze --thread '<t>' --until '+2h'` (or `HH:MM` or ISO), `t3ctl unsnooze --thread '<t>'` |
 | Switch model (idle only) | `t3ctl model --thread '<t>' --model <m> [--effort e] [--provider p]` |
-| Fork to try an idea | `t3ctl fork --thread '<t>' --title '<x>'` |
+| Fork to try an idea | `t3ctl fork --thread '<t>' --title '<x>' [--owner <subscriber>]` |
 
 ## Queue
 A message sent with `--queue` waits until the current run ends. Queued messages can get stranded when a run is cancelled or the queue is held.

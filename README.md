@@ -86,8 +86,7 @@ Queued messages, including a held queue, prevent a final notification. Filtered 
   "subscribers": [
     { "name": "dev", "url": "https://...", "headers": { "Authorization": "Bearer ..." },
       "match": { "exclude": { "titlePrefix": ["SHORTS-"], "titleRegex": ["\\b(trailers?|devlogs?|clips?|posting|social)\\b"], "branch": ["t3/shorts-*", "t3/trailer-*"] } } },
-    { "name": "marketing", "url": "https://...", "watch": "final,waiting-user,failed,cancelled", "delegated": "failed",
-      "match": { "include": { "titlePrefix": ["SHORTS-"], "branch": ["t3/shorts-*", "t3/trailer-*"] } } } ] }
+    { "name": "marketing", "url": "https://...", "default": false, "watch": "final,waiting-user,failed,cancelled" } ] }
 ```
 
 - Rules (under `include` or `exclude`): `titlePrefix` (not case-sensitive), `titleRegex` (`"text"` is not case-sensitive, or use `"/re/flags"`), `branch` (glob, `*` matches anything including `/`), `threadId` (glob) and `project` (glob, not case-sensitive). With `include`, a thread has to match at least one rule. Without `include`, every thread matches. Any `exclude` hit drops the thread.
@@ -108,6 +107,27 @@ node t3listen test --subscriber marketing       # one event flagged "test": true
 ```
 
 `--url-file` takes the URL on line 1, optionally followed by `Name: value` header lines, or a JSON file `{"url","headers"}`. `--key-file` reads a single key and sends it as `Authorization: Bearer <key>`; to send it under another header as-is, add `--key-header Name`. Rule flags can be repeated: `--include-` or `--exclude-` followed by `title-prefix`, `title-regex`, `branch`, `thread` or `project`. Passing any rule flag replaces the subscriber's existing rules; `--clear-rules` removes them all. The first `subscribe` on a single-webhook config keeps the existing webhook as subscriber `"default"` (or moves it under a name of your choice with `--from-current`), so no events are lost. After a restart, each event is resent only to the subscribers that didn't get it.
+
+### Thread owners (routing.json)
+
+Thread ownership is set per thread, so neither title words nor branch names decide it. Subscribers with `"default": true` (the default when the key is missing) get every thread that has no owner, including threads you start by hand in T3. A subscriber with `"default": false` gets only the threads it owns, plus any unowned thread its `include` rules match. `~/t3-tots/routing.json` (private, written with a lock and an atomic rename) maps a thread id to its owner, and can also mute one thread for one subscriber:
+
+```json
+{ "version": 1, "owners": { "thread:project:…": { "owner": "marketing", "at": "2026-10-28T08:00:00Z", "by": "t3ctl new" } }, "mutes": { "dev": { "thread:…": "2026-10-28T08:00:00Z" } } }
+```
+
+An owned thread goes only to its owner. Sub-task threads follow their parent's owner and keep the per-subscriber `delegated` policy (failures only by default). If the owner isn't a configured subscriber, the thread goes back to the defaults. The listener rereads the file whenever it changes, so claims apply from the next event without a restart.
+
+```
+node t3listen claim <thread id|title> marketing   # only marketing gets it (and its sub-tasks) from now on
+node t3listen release <thread>                    # back to the default subscribers
+node t3listen owner <thread>                      # owner (own or inherited) and where final/failed events go
+node t3listen owners                              # counts per owner and the last 20 claims
+node t3listen mute|unmute <thread> <subscriber>   # drop one thread for one subscriber
+t3ctl new --project P --prompt-file f --owner marketing   # or T3_OWNER=marketing; t3ctl fork takes --owner too
+```
+
+To decide who owns a thread, look at its content. Game or engine code meant to be committed to main belongs to `dev`. Producing video, setting up a scene, posting and social work belong to `marketing`, which asks dev when it needs a new tool. Each bot claims the threads it starts (`--owner dev` / `--owner marketing`). Dev gets every unowned thread by default, and hands a thread to marketing with `claim` as soon as it sees the thread is marketing work.
 
 Setup, events, approvals, and autoresume: [t3-phone-answers](skills/t3-phone-answers/SKILL.md). Who may answer: [t3-tots-rules "Decisions"](skills/t3-tots-rules/SKILL.md).
 

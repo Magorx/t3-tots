@@ -39,7 +39,7 @@ How to work:
 ```
 
 ## 3. Start it
-1. On the user's yes: `t3ctl new --project '<P>' --model <m> --effort <e> --title '<Project> PM' --prompt-file <file>`.
+1. On the user's yes: `t3ctl new --project '<P>' --model <m> --effort <e> --title '<Project> PM' --prompt-file <file> --owner <subscriber>`. The owner follows t3-tots-rules "Thread owners": `dev` for game or engine work meant for main, `marketing` for video, scene or posting work. Sub-task threads follow the PM's owner. A separate worker thread started with `t3ctl new` needs its own `--owner`. Tell the PM in its prompt to pass the same `--owner` when it starts worker threads with `t3ctl new`.
 2. Start one t3-watch routine for the PM thread with `t3ctl watch`. Add each worker and reviewer thread to the same watch as the PM starts them. `t3ctl subtasks --thread '<PM>'` lists the ones it started as sub-tasks, and `t3ctl threads --project '<P>' --limit 20` the ones it started as separate threads.
 3. Tell the user in two lines: the PM thread's title and id, and what you'll bring to them.
 

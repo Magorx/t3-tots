@@ -41,6 +41,9 @@ const okUrl = (u) => /^https:\/\//.test(u || "") || /^http:\/\/(127\.0\.0\.1|loc
 // threadId (glob), project (case-insensitive glob). include: a thread must hit at least one rule (none = every thread); exclude: any hit drops it.
 // delegated (sub-task threads): "failed" (default, as before: run ends only when they fail), "all", or "none" (no events at all);
 // delegatedMatch: "parent" (default: a sub-task thread is matched by its parent thread's title/branch/id/project) or "self".
+// default (true when absent): gets threads nobody owns. A subscriber with "default": false gets only threads it owns
+// (or unowned threads its include rules match). Ownership lives in routing.json (see "thread ownership" below):
+// an owned thread goes ONLY to its owner; mutes drop one thread (and its sub-tasks) for one subscriber.
 // No "subscribers" key = exactly the old single webhook (top-level url/headers/watch).
 const SUB_NAME = /^[A-Za-z0-9_.-]{1,40}$/, DELEGATED_MODES = ["failed", "all", "none"], DELEGATED_MATCH = ["parent", "self"];
 const RULE_KEYS = ["titlePrefix", "titleRegex", "branch", "threadId", "project"];
@@ -74,14 +77,15 @@ function subscriberOf(x, i, defWatch) {
   if (!DELEGATED_MATCH.includes(delegatedMatch)) throw new Error(`BAD_LISTEN_CONFIG: subscriber "${name}" delegatedMatch must be one of ${DELEGATED_MATCH.join(", ")}`);
   const m = x.match ?? {}; if (typeof m !== "object" || Array.isArray(m)) throw new Error(`BAD_LISTEN_CONFIG: subscriber "${name}" match must be an object`);
   for (const k of Object.keys(m)) if (!["include", "exclude"].includes(k)) throw new Error(`BAD_LISTEN_CONFIG: subscriber "${name}" match has unknown key "${k}" (use include, exclude)`);
-  return { name, url: x.url, headers: x.headers || {}, watch, delegated, delegatedMatch, enabled: x.enabled !== false,
+  if (x.default !== undefined && typeof x.default !== "boolean") throw new Error(`BAD_LISTEN_CONFIG: subscriber "${name}" default must be true or false`);
+  return { name, url: x.url, headers: x.headers || {}, watch, delegated, delegatedMatch, enabled: x.enabled !== false, default: x.default !== false,
     include: compileRules(m.include, `subscriber "${name}" match.include`), exclude: compileRules(m.exclude, `subscriber "${name}" match.exclude`) };
 }
 function configFrom(c, opts = {}) { // pure: listen.json object -> runtime config (throws BAD_LISTEN_CONFIG)
   const defWatch = watchList(c.watch), multi = c.subscribers !== undefined;
   if (multi && !Array.isArray(c.subscribers)) throw new Error("BAD_LISTEN_CONFIG: subscribers must be an array");
   const subscribers = multi ? c.subscribers.map((x, i) => subscriberOf(x, i, defWatch))
-    : [{ name: "default", url: c.url, headers: c.headers || {}, watch: defWatch, delegated: "failed", delegatedMatch: "self", enabled: true, include: null, exclude: null, legacy: true }];
+    : [{ name: "default", url: c.url, headers: c.headers || {}, watch: defWatch, delegated: "failed", delegatedMatch: "self", enabled: true, default: true, include: null, exclude: null, legacy: true }];
   const names = subscribers.map((x) => x.name), dup = names.find((n, i) => names.indexOf(n) !== i);
   if (dup) throw new Error(`BAD_LISTEN_CONFIG: two subscribers are named "${dup}"`);
   if (!opts.dry) for (const x of subscribers) if (x.enabled && !okUrl(x.url)) throw new Error(multi ? `BAD_LISTEN_CONFIG: subscriber "${x.name}" url must start with https:// (http only for localhost)` : "BAD_LISTEN_CONFIG: listen.json url must start with https:// (http only for localhost)");
@@ -97,12 +101,34 @@ function loadConfig() {
 }
 // which subscribers get event e. info: { self: {threadId,title,branch,project}, parent: same or null, delegated }
 const stateOf = (e) => e.turnState || (e.requestId ? "waiting-user" : END_STATE[e.event] || "final");
-function routeFor(subs, e, info) {
-  const state = stateOf(e);
+// ---------- thread ownership: routing.json { owners: { threadId: { owner, at, by } }, mutes: { subscriber: { threadId: at } } } ----------
+// Re-read whenever the file changes (stat per event), so claims apply without a restart. Writers take a lock dir and rename atomically.
+const ROUTING = path.join(DIR, "routing.json");
+const emptyRouting = () => ({ version: 1, owners: {}, mutes: {} });
+function normRouting(j) {
+  const r = emptyRouting(); if (!j || typeof j !== "object" || Array.isArray(j)) return r;
+  if (j.owners && typeof j.owners === "object") r.owners = j.owners; if (j.mutes && typeof j.mutes === "object") r.mutes = j.mutes; return r;
+}
+let routingCache = { key: "", data: emptyRouting() };
+function readRouting() {
+  let st; try { st = fs.statSync(ROUTING); } catch { routingCache = { key: "none", data: emptyRouting() }; return routingCache.data; }
+  const key = `${st.mtimeMs}|${st.size}|${st.ino}`; if (key === routingCache.key) return routingCache.data;
+  try { routingCache = { key, data: normRouting(JSON.parse(fs.readFileSync(ROUTING, "utf8"))) }; } catch { /* keep the last good copy */ }
+  return routingCache.data;
+}
+const ownerName = (r, id) => { const v = id && r.owners[id]; return v ? (typeof v === "string" ? v : v.owner) || null : null; };
+// a thread's own owner, else (sub-task thread) its parent's
+const ownerOf = (r, info) => ownerName(r, info.self.threadId) || (info.delegated && info.parent ? ownerName(r, info.parent.threadId) : null);
+const mutedFor = (r, name, info) => { const m = r.mutes[name] || {}; return !!(m[info.self.threadId] || (info.delegated && info.parent && m[info.parent.threadId])); };
+function routeFor(subs, e, info, routing = emptyRouting()) {
+  const state = stateOf(e), owner = ownerOf(routing, info), own = owner && subs.find((x) => x.name === owner && x.enabled);
   return subs.filter((x) => {
     if (!x.enabled || (e.event !== "test" && !x.watch.includes(state))) return false;
     if (info.delegated && (x.delegated === "none" || (x.delegated === "failed" && END_WORD[e.event] && e.event !== "thread.failed"))) return false;
-    return threadMatches(x, info.delegated && x.delegatedMatch === "parent" && info.parent ? info.parent : info.self);
+    if (mutedFor(routing, x.name, info)) return false;
+    if (own) return x === own; // an owned thread goes only to its owner, whatever the rules say
+    const target = info.delegated && x.delegatedMatch === "parent" && info.parent ? info.parent : info.self;
+    return x.default ? threadMatches(x, target) : !!x.include && threadMatches(x, target);
   });
 }
 function watch() { // change only the public selection; never print the URL or headers
@@ -245,13 +271,13 @@ function routeInfo(e) { // what subscriber rules look at, from the live shell wh
   return { self, parent: par ? of(par) : null, delegated: !!(e.delegated || String(e.threadId || "").startsWith(DELEGATED)) };
 }
 // a hand-built C (tests, older callers) without a subscribers list acts as the single legacy webhook
-const subsList = () => C.subscribers || [{ name: "default", url: C.url, headers: C.headers || {}, watch: C.watch || [], delegated: "failed", delegatedMatch: "self", enabled: true, include: null, exclude: null, legacy: true }];
+const subsList = () => C.subscribers || [{ name: "default", url: C.url, headers: C.headers || {}, watch: C.watch || [], delegated: "failed", delegatedMatch: "self", enabled: true, default: true, include: null, exclude: null, legacy: true }];
 const payloadFor = (sub, e) => (C.multi ? { ...e, subscriber: sub.name } : e);
 async function deliver(e) {
   if (!C.watch.includes(stateOf(e))) return true;
   cleanEvent(e); e.text = summary(e); e.sentAt = new Date().toISOString(); e.eventId = crypto.createHash("sha256").update(`${e.event}|${ref(e)}${e.runId && MID_STATES.has(e.turnState) ? "|" + e.turnState : ""}`).digest("hex").slice(0, 16);
   const rec = C.multi ? sentRec(e) : null, done = new Set((rec && rec[sentKey(e)]) || []);
-  const subs = routeFor(subsList(), e, routeInfo(e)).filter((x) => !done.has(x.name));
+  const subs = routeFor(subsList(), e, routeInfo(e), C.multi ? readRouting() : emptyRouting()).filter((x) => !done.has(x.name));
   if (C.multi && (DRY || VERBOSE)) log(`route ${e.event} "${e.title}" -> ${subs.map((x) => x.name).join(",") || "(no subscriber)"}`);
   if (!subs.length) { if (!DRY) markDelivered(e); return true; }
   if (DRY) { log("DRY-RUN payload " + JSON.stringify(e)); delivered++; return true; }
@@ -710,7 +736,7 @@ function status() {
   if (!running) { const p = +(fs.existsSync(PID) && fs.readFileSync(PID, "utf8")); if (p) try { process.kill(p, 0); running = true; pid = p; } catch {} }
   const st = readJSON(STATE, { sent: {} }), open = Object.values(st.sent || {}).filter((s) => !s.skipped).length;
   let tail = ""; try { tail = fs.readFileSync(LOG, "utf8").trim().split("\n").slice(-3).join("\n"); } catch {}
-  console.log(`autostart: ${inst}\nrunning: ${running ? `yes (pid ${pid})` : "no"}\nconfig: ${fs.existsSync(CONF) ? "listen.json present" : "no listen.json yet"}${Array.isArray(readJSON(CONF, {}).subscribers) ? `\nsubscribers: ${readJSON(CONF, {}).subscribers.map((x) => x && x.name).join(", ") || "(none)"}` : ""}\napprovals: ${approvalsLine(readJSON(CONF, {}).approvals === true, /--approvals\b/.test(serviceArgs()))}\nopen questions sent: ${open}${tail ? `\nlast log lines:\n${tail}` : ""}`);
+  console.log(`autostart: ${inst}\nrunning: ${running ? `yes (pid ${pid})` : "no"}\nconfig: ${fs.existsSync(CONF) ? "listen.json present" : "no listen.json yet"}${Array.isArray(readJSON(CONF, {}).subscribers) ? `\nsubscribers: ${readJSON(CONF, {}).subscribers.map((x) => x && x.name).join(", ") || "(none)"}` : ""}\n${fs.existsSync(ROUTING) ? `owned threads: ${Object.keys(readRouting().owners).length} (routing.json)\n` : ""}approvals: ${approvalsLine(readJSON(CONF, {}).approvals === true, /--approvals\b/.test(serviceArgs()))}\nopen questions sent: ${open}${tail ? `\nlast log lines:\n${tail}` : ""}`);
 }
 async function test() { // one event flagged test:true to every subscriber (or --subscriber name); ignores watch and match rules
   C = loadConfig(); const only = optv("--subscriber"), subs = C.subscribers.filter((x) => x.enabled && (!only || x.name === only));
@@ -746,10 +772,10 @@ const RULE_FLAGS = { "title-prefix": "titlePrefix", "title-regex": "titleRegex",
 const describeRules = (r) => Object.entries(r || {}).map(([k, v]) => `${k} ${JSON.stringify(asList(v))}`).join("; ");
 function describeSub(x, defWatch) {
   const w = x.watch === undefined ? `${defWatch.join(",")} (default)` : (typeof x.watch === "string" ? splitList(x.watch) : x.watch).join(",") || "(none)";
-  const m = x.match || {}, lines = [`${x.name}${x.enabled === false ? " (disabled)" : ""}: url ${x.url ? "set" : "MISSING"}, ${Object.keys(x.headers || {}).length} header(s); watch ${w}; sub-tasks ${x.delegated || "failed"} (matched by ${x.delegatedMatch || "parent"})`];
+  const m = x.match || {}, lines = [`${x.name}${x.enabled === false ? " (disabled)" : ""}: url ${x.url ? "set" : "MISSING"}, ${Object.keys(x.headers || {}).length} header(s); watch ${w}; sub-tasks ${x.delegated || "failed"} (matched by ${x.delegatedMatch || "parent"}); ${x.default === false ? "owned threads only" : "default: gets unowned threads"}`];
   if (m.include && describeRules(m.include)) lines.push(`  include: ${describeRules(m.include)}`);
   if (m.exclude && describeRules(m.exclude)) lines.push(`  exclude: ${describeRules(m.exclude)}`);
-  if (lines.length === 1) lines.push("  match: every thread");
+  if (lines.length === 1) lines.push(x.default === false ? "  match: only threads it owns" : "  match: every unowned thread");
   return lines.join("\n");
 }
 function subscribe() {
@@ -780,6 +806,7 @@ function subscribe() {
   if (flag("--default-watch")) delete sub.watch;
   for (const [f, k] of [["--delegated", "delegated"], ["--delegated-match", "delegatedMatch"]]) { const v = optv(f); if (v !== undefined) sub[k] = v; }
   if (flag("--disable")) sub.enabled = false; if (flag("--enable")) delete sub.enabled;
+  if (flag("--no-default")) sub.default = false; if (flag("--default")) delete sub.default;
   out.subscribers = subs; configFrom(out, { dry: true }); // validates rules, regexes, watch and names before anything is written
   if (!DRY) writeConf(out);
   console.log(`${DRY ? "would save" : "saved"} subscriber ${describeSub(sub, watchList(out.watch))}${notes.length ? `\nnote: ${notes.join("; ")}` : ""}${DRY ? "" : `\nRestart the listener to apply: node "${path.join(DIR, "t3listen")}" install`}`);
@@ -798,13 +825,86 @@ function subscribers() {
   if (!Array.isArray(c.subscribers)) { console.log(`no subscribers list: every event goes to the single webhook (url ${c.url ? "set" : "MISSING"}, ${Object.keys(c.headers || {}).length} header(s); watch ${defWatch.join(",") || "(none)"})`); return; }
   console.log(c.subscribers.length ? c.subscribers.map((x) => describeSub(x, defWatch)).join("\n") : "subscribers list is empty: no events are sent");
 }
+function routingLocked(fn) { // lock dir + strict read + atomic rename; safe with several agents at once
+  const lock = ROUTING + ".lock", t0 = Date.now(), nap = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    try { fs.mkdirSync(lock); break; } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      try { if (Date.now() - fs.statSync(lock).mtimeMs > 10000) { fs.rmdirSync(lock); continue; } } catch {}
+      if (Date.now() - t0 > 15000) die("ROUTING_LOCKED", `routing.json stayed locked for 15s (remove ${lock} if no t3listen command is running)`);
+      Atomics.wait(nap, 0, 0, 10 + Math.floor(Math.random() * 30));
+    }
+  }
+  try {
+    let r = emptyRouting();
+    if (fs.existsSync(ROUTING)) { try { r = normRouting(JSON.parse(fs.readFileSync(ROUTING, "utf8"))); } catch { die("BAD_ROUTING", "routing.json is unreadable; nothing changed (fix or restore it)"); } }
+    const out = fn(r);
+    if (out !== false && !DRY) { const tmp = `${ROUTING}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.part`; fs.writeFileSync(tmp, JSON.stringify(r, null, 1) + "\n", { mode: 0o600 }); fs.renameSync(tmp, ROUTING); lockDown(ROUTING); }
+    return out;
+  } finally { try { fs.rmdirSync(lock); } catch {} }
+}
+const subNames = () => { const c = readJSON(CONF, null); return c && Array.isArray(c.subscribers) ? c.subscribers.map((x) => x && x.name).filter(Boolean) : []; };
+function claimMany(ids, owner, by = "t3listen claim") { // -> { claimed, already, was: { id: previous owner } }
+  const at = new Date().toISOString(), res = { claimed: 0, already: 0, was: {} };
+  routingLocked((r) => { for (const id of ids) { const prev = ownerName(r, id); if (prev === owner) { res.already++; continue; }
+    res.was[id] = prev; r.owners[id] = { owner, at, by }; if (r.mutes[owner]) delete r.mutes[owner][id]; res.claimed++; }
+    return res.claimed ? undefined : false; });
+  return res;
+}
+const positional = () => { const out = []; for (let i = 1; i < argv.length; i++) { const a = argv[i]; if (a.startsWith("--")) { if (!a.includes("=") && ["--by", "--limit"].includes(a)) i++; continue; } out.push(a); } return out; };
+async function threadRef(q) { // exact id with --exact (fast, no T3 call); else T3's list when it's up (id, 8+ prefix, title), else an id-like value as-is
+  if (flag("--exact")) return { id: q, title: null };
+  const ep = endpoint(); let sh = null;
+  if (ep && ep.token) { try { const r = await fetch(`${ep.base}/api/orchestration/shell`, { headers: ep.H, signal: AbortSignal.timeout(5000) }); if (r.ok) sh = await r.json(); } catch {} }
+  if (!sh) { if (idLike(q)) return { id: q, title: null }; die("NO_T3", `T3 isn't reachable to look up "${q}"; pass the thread id (with --exact)`); }
+  for (const pr of sh.projects || []) meta.projects.set(pr.id, pr.title); for (const t of sh.threads || []) meta.threads.set(t.id, t);
+  try { const t = pickThread([...(sh.threads || []), ...(sh.archivedThreads || [])], q); meta.threads.set(t.id, t); return { id: t.id, title: t.title, t }; }
+  catch (err) { const [w, ...rest] = err.message.split(": "); if (w === "NOT_FOUND" && idLike(q)) return { id: q, title: null }; die(w, rest.join(": ")); }
+}
+async function claim() {
+  const [q, owner] = positional(); if (!q || !owner) die("USAGE", "claim <thread id|title> <subscriber> [--exact] [--by who]");
+  const names = subNames(); if (!names.includes(owner) && !flag("--force")) die("NO_SUBSCRIBER", `no subscriber named "${owner}" in listen.json (have: ${names.join(", ") || "none"}); --force claims anyway`);
+  const t = await threadRef(q), res = claimMany([t.id], owner, optv("--by") || "t3listen claim");
+  console.log(`${DRY ? "would claim" : res.claimed ? "claimed" : "already owned"}: ${t.id}${t.title ? ` "${trim(clean(t.title), 70)}"` : ""} -> only ${owner}${res.claimed ? ` (was ${res.was[t.id] || "unowned: default subscribers"})` : ""}`);
+}
+async function release() {
+  const [q] = positional(); if (!q) die("USAGE", "release <thread id|title> [--exact]");
+  const t = await threadRef(q); let was = null;
+  routingLocked((r) => { was = ownerName(r, t.id); if (!was) return false; delete r.owners[t.id]; });
+  console.log(was ? `${DRY ? "would release" : "released"}: ${t.id}${t.title ? ` "${trim(clean(t.title), 70)}"` : ""} (was ${was}); it goes to the default subscribers again` : `not owned: ${t.id} already goes to the default subscribers`);
+}
+async function mute(on) {
+  const [q, name] = positional(); if (!q || !name) die("USAGE", `${on ? "mute" : "unmute"} <thread id|title> <subscriber> [--exact]`);
+  if (!subNames().includes(name) && !flag("--force")) die("NO_SUBSCRIBER", `no subscriber named "${name}"`);
+  const t = await threadRef(q);
+  routingLocked((r) => { const m = r.mutes[name] || (r.mutes[name] = {}); if (on) m[t.id] = new Date().toISOString(); else { if (!m[t.id]) return false; delete m[t.id]; if (!Object.keys(m).length) delete r.mutes[name]; } });
+  console.log(`${on ? "muted" : "unmuted"} ${t.id}${t.title ? ` "${trim(clean(t.title), 70)}"` : ""} for ${name}`);
+}
+async function owner() {
+  const [q] = positional(); if (!q) die("USAGE", "owner <thread id|title> [--exact]");
+  C = loadConfig(); const t = await threadRef(q), R = readRouting();
+  const tt = meta.threads.get(t.id) || {}, e = { threadId: t.id, title: clean(t.title || tt.title || t.id), delegated: t.id.startsWith(DELEGATED) }, info = routeInfo(e);
+  const own = ownerName(R, t.id), via = !own && ownerOf(R, info);
+  const to = (st, ev) => routeFor(C.subscribers, { ...e, event: ev, turnState: st }, info, R).map((x) => x.name).join(",") || "(none)";
+  console.log(`${t.id}${t.title ? ` "${trim(clean(t.title), 70)}"` : ""}\nowner: ${own || (via ? `${via} (inherited from parent ${tt.lineage.parentThreadId})` : `none (default: ${C.subscribers.filter((x) => x.enabled && x.default).map((x) => x.name).join(", ") || "nobody"})`)}`
+    + `${Object.entries(R.mutes).filter(([, m]) => m[t.id]).map(([n]) => `\nmuted for: ${n}`).join("")}\nfinal -> ${to("final", "thread.finished")}; failed -> ${to("failed", "thread.failed")}`);
+}
+async function owners() {
+  const R = readRouting(), list = Object.entries(R.owners).map(([id, v]) => ({ id, owner: typeof v === "string" ? v : v.owner, at: (v && v.at) || "", by: (v && v.by) || "" }));
+  const counts = {}; for (const x of list) counts[x.owner] = (counts[x.owner] || 0) + 1;
+  const muted = Object.entries(R.mutes).map(([n, m]) => `${n} ${Object.keys(m).length}`).join(", ");
+  console.log(`owned threads: ${list.length}${list.length ? ` (${Object.entries(counts).map(([n, k]) => `${n} ${k}`).join(", ")})` : ""}; muted: ${muted || "none"}; everything else goes to the default subscribers`);
+  let titles = new Map(); const ep = endpoint();
+  if (ep && ep.token) { try { const r = await fetch(`${ep.base}/api/orchestration/shell`, { headers: ep.H, signal: AbortSignal.timeout(5000) }); if (r.ok) { const sh = await r.json(); titles = new Map([...(sh.threads || []), ...(sh.archivedThreads || [])].map((t) => [t.id, t.title])); } } catch {} }
+  for (const x of list.sort((a, b) => b.at.localeCompare(a.at)).slice(0, +(optv("--limit")) || 20)) console.log(`${x.owner.padEnd(12)} ${x.at.slice(0, 16)}  ${x.id}${titles.get(x.id) ? `  "${trim(clean(titles.get(x.id)), 60)}"` : ""}${x.by ? `  (${x.by})` : ""}`);
+}
 async function route() { // which subscribers would get a thread's events; reads T3 (or a made-up thread), sends nothing
   C = loadConfig(); const state = optv("--state") || "final", event = optv("--event") || (state === "failed" ? "thread.failed" : state === "cancelled" ? "thread.cancelled" : "thread.finished");
-  const names = (e, info) => routeFor(C.subscribers, e, info).map((x) => x.name).join(",") || "(none)";
+  const R = readRouting(), names = (e, info) => routeFor(C.subscribers, e, info, R).map((x) => x.name).join(",") || "(none)";
   if (["--title", "--branch", "--thread-id", "--project"].some((f) => optv(f) !== undefined)) {
     const self = { threadId: optv("--thread-id") || "synthetic", title: optv("--title") || "", branch: optv("--branch") ?? null, project: optv("--project") ?? null };
     const info = { self, parent: null, delegated: flag("--delegated") || self.threadId.startsWith(DELEGATED) };
-    console.log(`${state}: ${names({ event, turnState: state, threadId: self.threadId }, info)}`); return;
+    const ow = ownerOf(R, info); console.log(`${state}: ${names({ event, turnState: state, threadId: self.threadId }, info)}${ow ? `  (owner ${ow})` : ""}`); return;
   }
   const ep = endpoint(); if (!ep) die("NO_T3", "T3 Code isn't running here");
   let sh = {}; try { const r = await fetch(`${ep.base}/api/orchestration/shell`, { headers: ep.H }); if (!r.ok) throw new Error(`HTTP ${r.status}`); sh = await r.json(); } catch (err) { die("NO_T3", `couldn't read T3: ${err.message}`); }
@@ -814,9 +914,9 @@ async function route() { // which subscribers would get a thread's events; reads
   if (q) { try { list = [pickThread([...(sh.threads || []), ...(sh.archivedThreads || [])], q)]; } catch (err) { const [w, ...rest] = err.message.split(": "); die(w, rest.join(": ")); } meta.threads.set(list[0].id, list[0]); }
   const counts = Object.fromEntries(C.subscribers.map((x) => [x.name, 0])); let none = 0; const rows = [];
   for (const t of list) {
-    const e = { event, turnState: state, threadId: t.id, title: clean(t.title || t.id), delegated: t.id.startsWith(DELEGATED) }, got = routeFor(C.subscribers, e, routeInfo(e));
+    const e = { event, turnState: state, threadId: t.id, title: clean(t.title || t.id), delegated: t.id.startsWith(DELEGATED) }, info = routeInfo(e), got = routeFor(C.subscribers, e, info, R), ow = ownerOf(R, info);
     for (const x of got) counts[x.name]++; if (!got.length) none++;
-    rows.push(`${(got.map((x) => x.name).join(",") || "-").padEnd(18)} ${trim(e.title, 70)}${t.branch ? `  [${t.branch}]` : ""}`);
+    rows.push(`${(got.map((x) => x.name).join(",") || "-").padEnd(18)} ${(ow ? `owner:${ow}` : "unowned").padEnd(18)} ${trim(e.title, 70)}${t.branch ? `  [${t.branch}]` : ""}${q ? `  ${t.id}` : ""}`);
   }
   if (q || flag("--list")) console.log(rows.join("\n"));
   console.log(`${state} events from ${list.length} live thread(s): ${Object.entries(counts).map(([n, k]) => `${n} ${k}`).join(", ")}, none ${none}`);
@@ -861,13 +961,16 @@ const USAGE = `t3listen [run] [--dry-run] [--once [--timeout s]] [--approvals] [
 t3listen setup [--machine name]   read the webhook URL (line 1) and 'Name: value' header lines from stdin into listen.json (private)
 t3listen test [--dry-run]         send one test event to the webhook
 t3listen watch [final,waiting-user,failed,cancelled,waiting-subagents,waiting-command]   print or set states to POST (restart to apply; an empty string watches none)
-t3listen subscribe <name> --url-file <path> [--key-file <path> [--key-header Name]] | --from-current [--include-title-prefix X] [--include-title-regex RE] [--include-branch glob] [--include-thread id] [--include-project P]
+t3listen subscribe <name> --url-file <path> [--key-file <path> [--key-header Name]] | --from-current [--no-default | --default] [--include-title-prefix X] [--include-title-regex RE] [--include-branch glob] [--include-thread id] [--include-project P]
                  [--exclude-... same] [--clear-rules] [--watch a,b | --default-watch] [--delegated failed|all|none] [--delegated-match parent|self] [--disable|--enable]
                                   add or update one webhook subscriber (repeat flags for several values; restart to apply)
 t3listen unsubscribe <name> | subscribers   remove one / list names, watch and match rules (URLs never printed)
+t3listen claim <thread> <subscriber> [--exact] [--by who]   only that subscriber gets the thread (and its sub-tasks) from now on; no restart needed
+t3listen release <thread> | owner <thread> | owners [--limit n]   back to the default subscribers / show one thread's owner and route / counts and the last 20
+t3listen mute|unmute <thread> <subscriber>   drop (or restore) one thread and its sub-tasks for one subscriber
 t3listen route [--thread id|title | --title T --branch B --project P --thread-id ID --delegated] [--state final] [--list]   which subscribers would get it (sends nothing)
 t3listen test [--subscriber name]   send one test event (test: true) to every subscriber, or one
 t3listen preview-finish --thread id|title   print the run-end event for a thread's latest ended run (sends nothing)
 t3listen install [--approvals] | uninstall | status   start at login (macOS LaunchAgent, Windows logon task, Linux systemd --user)`;
-if (require.main !== module) module.exports = { watchList, turnDetails, pickThread, idLike, systemdUnit, localTime, configFrom, routeFor, rulesHit, compileRules, globRe, threadMatches, approvalsLine, staleMinutes, RED, clean, cleanEvent, summary, requestInfo, endedAt, tickLastAlive, catchUpThreads, afterSnapshotListen, usageLimitFields, shellReadyToArm, canArmResume };
-else ({ run, setup, watch: async () => watch(), test, "preview-finish": previewFinish, subscribe: async () => subscribe(), unsubscribe: async () => unsubscribe(), subscribers: async () => subscribers(), route, install: async () => install(), uninstall: async () => uninstall(), status: async () => status() }[cmd] || (async () => console.log(USAGE)))().catch((e) => { console.error("error:", e.message); process.exit(1); });
+if (require.main !== module) module.exports = { watchList, turnDetails, pickThread, idLike, systemdUnit, localTime, configFrom, routeFor, claimMany, readRouting, ownerOf, emptyRouting, ROUTING, rulesHit, compileRules, globRe, threadMatches, approvalsLine, staleMinutes, RED, clean, cleanEvent, summary, requestInfo, endedAt, tickLastAlive, catchUpThreads, afterSnapshotListen, usageLimitFields, shellReadyToArm, canArmResume };
+else ({ run, setup, watch: async () => watch(), test, "preview-finish": previewFinish, subscribe: async () => subscribe(), unsubscribe: async () => unsubscribe(), subscribers: async () => subscribers(), route, claim, release, owner, owners, mute: () => mute(true), unmute: () => mute(false), install: async () => install(), uninstall: async () => uninstall(), status: async () => status() }[cmd] || (async () => console.log(USAGE)))().catch((e) => { console.error("error:", e.message); process.exit(1); });

@@ -17,10 +17,11 @@ Follow the t3-tots-rules skill (skills/t3-tots-rules/SKILL.md), including "Sendi
 - If the prompt is longer than a few lines, write it to a file and pass `--prompt-file <file>`.
 
 ## 3. Send
-- New thread: `t3ctl new --project <P> --model <m> --effort <e> --prompt-file <file> [--title '<t>'] [--mode plan] [--attach a.png,b.jpg] [--wait --timeout 300]`
+- New thread: `t3ctl new --project <P> --model <m> --effort <e> --prompt-file <file> [--title '<t>'] [--mode plan] [--attach a.png,b.jpg] [--owner <subscriber>] [--wait --timeout 300]`
 - Follow-up: `t3ctl send --thread '<id|title>' --prompt-file <file> [--attach ...] [--queue] [--wait [--timeout 300]]`
 - Add `--queue` only when the user wants the follow-up to wait for the run to end.
 - Leave out `--wait` for long coding tasks, say it's running, and offer t3-watch.
+- `--owner <subscriber>` (or env `T3_OWNER`) claims the new thread for one t3listen subscriber, so only that webhook is notified, starting from the first event. Choose it by content, as in t3-tots-rules "Thread owners": game or engine code meant for main is `dev`; video, scenes, posting and social work is `marketing`. Pass your own subscriber: Waterfalls Dev uses `--owner dev`, Waterfalls Marketing uses `--owner marketing`. Without `--owner`, the default subscribers get the thread. If the claim fails, the thread still starts and t3ctl prints the `claim` command to retry.
 - `t3ctl new` records the thread in `started-here.json`, so t3listen arms Resume at reset if the thread later stops on a usage limit.
 
 ## Fallback on macOS

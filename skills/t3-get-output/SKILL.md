@@ -11,7 +11,7 @@ Follow the t3-tots-rules skill (skills/t3-tots-rules/SKILL.md). Steps that use t
 ## 1. Make it (skip when fetching)
 1. Resolve the computer, project and model as in t3-new-thread. Throwaway asks go to the user's sandbox project, from memory (ask once and save it if unknown), with `--model haiku --effort low`.
 2. Write the prompt to a file (t3-tots-rules "Sending into threads"). Ask for one output path and no other changes: "<ask>. Save it as <subdir>/<name>.<ext> in this project. Do not change any other files. Reply with the path."
-3. Start it: `t3ctl new --project '<P>' --model <m> --effort <e> --title '<short>' --prompt-file <file> --wait --timeout 600`. For long renders, leave out `--wait` and check later with `t3ctl read`.
+3. Start it: `t3ctl new --project '<P>' --model <m> --effort <e> --title '<short>' --prompt-file <file> --owner <subscriber> --wait --timeout 600` (`--owner marketing` for render, video or posting output, `--owner dev` otherwise; see t3-tots-rules "Thread owners"). For long renders, leave out `--wait` and check later with `t3ctl read`.
 
 ## 2. Fetch
 - `t3ctl files --thread '<t>' --last-turn` copies the files the last turn created or changed into `<tools folder>/out/`, keeping each file's path inside the project (`out/src/index.ts`), so files with the same name don't overwrite each other. Leave out `--last-turn` for the whole thread. It never copies dotfiles or dot folders (`.env`, `.ssh`, `.gnupg`), files whose path names a token, auth or oauth (as a word: `author.md` is fine), secret, credential, password, keychain or private key, key files (`id_rsa`, `id_ed25519`, `.pem`, `.p12`, `.key`), symlinks, or files outside the project; it lists them as not copied.

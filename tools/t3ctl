@@ -27,13 +27,24 @@ const netErr = (e) => new Error(`T3_NOT_REACHABLE: can't reach T3 at ${BASE} (${
 const uuid = () => crypto.randomUUID();
 
 // args: --key value, --flag, or --key=value (use the = form, or --prompt-file, for a value that starts with --)
+// --owner <subscriber> (or env T3_OWNER): the thread's t3listen events go only to that webhook subscriber from the first event on.
+// Uses t3listen's own claim (same routing.json, lock and checks). A failed claim never undoes the new thread; it is reported.
+function ownerOf(o, env = process.env) { const v = o.owner !== undefined ? o.owner : env.T3_OWNER; return v === undefined || v === true || String(v).trim() === "" ? null : String(v).trim(); }
+function claimOwner(id, o, by) {
+  const owner = ownerOf(o); if (!owner) return null;
+  const tl = path.join(__dirname, "t3listen");
+  if (!fs.existsSync(tl)) { console.error(`owner not set: no t3listen next to t3ctl (wanted ${owner}). Later: node t3listen claim ${id} ${owner}`); return false; }
+  const r = require("child_process").spawnSync(process.execPath, [tl, "claim", id, owner, "--exact", "--by", by], { encoding: "utf8", timeout: 30000 });
+  if (r.status === 0) { console.log(`owner: ${owner} (t3listen sends this thread's events only to ${owner})`); return true; }
+  console.error(`owner not set (${String(r.stderr || r.stdout || r.error || "").trim().split("\n")[0].slice(0, 200)}). Retry: node t3listen claim ${id} ${owner}`); return false;
+}
 function args(a = process.argv.slice(3)) { const o = {}; for (let i = 0; i < a.length; i++) { if (a[i].startsWith("--")) { const eq = a[i].indexOf("=");
   if (eq > 2) { o[a[i].slice(2, eq)] = a[i].slice(eq + 1); continue; }
   const k = a[i].slice(2); const v = a[i + 1] !== undefined && !a[i + 1].startsWith("--") ? a[++i] : true; o[k] = v; } } return o; }
 // flags that always take a value; "--from --to dir" must not read as --from=true
 const VALUE_FLAGS = new Set(["thread", "project", "prompt", "prompt-file", "model", "effort", "title", "mode", "attach", "timeout", "from", "to", "only", "text", "pick", "answers",
   "decision", "request", "query", "q", "limit", "last", "number", "repo", "state", "stall-min", "until", "every", "at", "days", "id", "subagent", "edit", "move", "before", "steer",
-  "run", "provider", "turn", "reason", "label", "chars", "runtime", "enable", "disable", "delete", "copy"]);
+  "run", "provider", "turn", "reason", "label", "chars", "runtime", "enable", "disable", "delete", "copy", "owner"]);
 function missingValue(o, cmd) { // --cancel takes a run id only for queue; elsewhere it is a switch
   return Object.keys(o).find((k) => o[k] === true && (VALUE_FLAGS.has(k) || (k === "cancel" && cmd === "queue"))); }
 async function get(p) {
@@ -489,7 +500,7 @@ const main = async () => {
   else if (cmd === "threads") { const s = await shell(); let ts = s.threads; if (o.project !== undefined) { const p = await findProject(o.project); ts = ts.filter((t) => t.projectId === p.id); } if (o.main) ts = ts.filter(isMainThread); const top = ts.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, +o.limit || 15);
     const ps = await Promise.all(top.map((t) => thread(t.id).then((r) => r.projection, () => null))); top.forEach((t, i) => console.log(threadLine(t, ps[i]))); }
   else if (cmd === "new") {
-    const prompt = promptOf(o); if (!o.project || !prompt) throw new Error("usage: new --project <path|name|id> (--prompt <text> | --prompt-file <path>) [--model m] [--effort e] [--title t] [--mode plan] [--wait [--timeout seconds]]");
+    const prompt = promptOf(o); if (!o.project || !prompt) throw new Error("usage: new --project <path|name|id> (--prompt <text> | --prompt-file <path>) [--model m] [--effort e] [--title t] [--mode plan] [--owner subscriber] [--wait [--timeout seconds]]");
     const p = await findProject(o.project); const s0 = await shell(); const sel = modelSel(o, p.defaultModelSelection || recentSel(s0, p.id) || recentSel(s0), s0);
     const title = o.title || prompt.slice(0, 60);
     const res = await rpc("orchestration.launchThread", { commandId: uuid(), creationSource: "web", projectId: p.id, title, generateTitle: !o.title,
@@ -498,6 +509,7 @@ const main = async () => {
     try { const sf = path.join(__dirname, "started-here.json"); let m = {}; try { m = JSON.parse(fs.readFileSync(sf, "utf8")) || {}; } catch {} // t3listen auto-resumes threads started here
       const cut = Date.now() - 60 * 864e5; for (const [k, v] of Object.entries(m)) if (!(Date.parse(v) > cut)) delete m[k]; m[res.threadId] = new Date().toISOString(); fs.writeFileSync(sf, JSON.stringify(m)); } catch {}
     console.log(`thread ${res.threadId}  project=${p.title}  model=${JSON.stringify(sel)}`);
+    claimOwner(res.threadId, o, "t3ctl new");
     if (o.wait) { const t = await wait(res.threadId, +o.timeout || 300); console.log(`title: ${t.title}  status: ${t.status}`); await printLast(res.threadId, 2); }
   }
   else if (cmd === "send") {
@@ -620,7 +632,7 @@ const main = async () => {
     if (o.run && !runs.some((r) => r.id === o.run)) throw new Error(`no run ${o.run} in "${t.title}" (see: t3ctl raw --thread ${t.id})`);
     const target = `thread:project:${t.projectId}:${uuid()}`;
     await dispatch("thread.fork", undefined, { createdBy: "user", creationSource: "web", sourceThreadId: t.id, targetThreadId: target, sourcePoint: o.run ? { type: "run", runId: String(o.run) } : { type: "latest_stable" }, ...(o.title ? { title: String(o.title) } : {}) });
-    console.log(`forked "${t.title}" -> ${target}${o.title ? `  "${o.title}"` : ""}`); }
+    console.log(`forked "${t.title}" -> ${target}${o.title ? `  "${o.title}"` : ""}`); claimOwner(target, o, "t3ctl fork"); }
   else if (cmd === "stop") { // run.interrupt with holdQueue: T3 also stops the thread's delegated sub-tasks (thread.stop is server-internal)
     const t = await findThread(o.thread); if (!t.activeRunId) { console.log(`"${t.title}" isn't running (nothing to stop)`); return; }
     await dispatch("run.interrupt", t.id, { runId: t.activeRunId, reason: String(o.reason || "t3ctl stop"), holdQueue: true });
@@ -646,7 +658,7 @@ const main = async () => {
     const tmp = `${sf}.${process.pid}.tmp`; fs.writeFileSync(tmp, JSON.stringify(st, null, 1)); fs.renameSync(tmp, sf);
     if (o.json) { if (out.length) console.log(JSON.stringify({ changes: out, threads: snaps.map(({ reply, ...x }) => x) })); return; }
     for (const e of out) console.log(`${e.kind}  "${e.title}"  ${e.text}`); }
-  else console.log("t3ctl projects | models | threads [--project p] [--main] [--limit n] | new --project p --prompt t [--model m --effort e] [--wait [--timeout seconds]] | send --thread id|title --prompt t [--wait [--timeout seconds]] [--queue] | queue --thread t [--steer runId|all | --cancel runId|all] | read --thread id|title [--last N] | settle|unsettle --thread t | rename --thread t --title x | interrupt --thread t [--hold] | status --thread t [--json] | pending --thread t [--json] | answer --thread t [--request id] (--pick label | --text txt | --answers json | --decision accept|decline|... [--user-approved] [--redirect]) | diff --thread t | files --thread t [--last-turn] [--copy no] | limits [--json] | snooze --thread t --until +2h|HH:MM|ISO | unsnooze --thread t | queue --thread t (--resume | --edit runId --text x | --move runId [--before runId|end | --first]) | model --thread t [--model m] [--effort e] [--provider p] | search --query q [--limit n] | tasks [--upsert ... [--prompt-file f] | --enable id | --disable id | --run id | --delete id --yes] | prs --project p [--state open] | pr --thread t [--number n] [--all] | pr --project p --repo o/r --number n | fork --thread t [--run runId] [--title x] | stop --thread t | subtasks --thread t [--all] | subagent-stop --thread t --subagent id | resume-at-reset --thread t [--cancel] | snooze-until-reset --thread t [--cancel] | watch --thread a[,b] [--state file] [--stall-min 20] [--json] | new/send ... --attach img1.png,img2.jpg | new/send ... --prompt-file p.md | send ... --no-verify | skills [list] [--from dir] [--to dir] | skills install --to dir [--from dir] [--only a,b] [--dry-run] [--force]");
+  else console.log("t3ctl projects | models | threads [--project p] [--main] [--limit n] | new --project p --prompt t [--model m --effort e] [--owner subscriber (or env T3_OWNER)] [--wait [--timeout seconds]] | send --thread id|title --prompt t [--wait [--timeout seconds]] [--queue] | queue --thread t [--steer runId|all | --cancel runId|all] | read --thread id|title [--last N] | settle|unsettle --thread t | rename --thread t --title x | interrupt --thread t [--hold] | status --thread t [--json] | pending --thread t [--json] | answer --thread t [--request id] (--pick label | --text txt | --answers json | --decision accept|decline|... [--user-approved] [--redirect]) | diff --thread t | files --thread t [--last-turn] [--copy no] | limits [--json] | snooze --thread t --until +2h|HH:MM|ISO | unsnooze --thread t | queue --thread t (--resume | --edit runId --text x | --move runId [--before runId|end | --first]) | model --thread t [--model m] [--effort e] [--provider p] | search --query q [--limit n] | tasks [--upsert ... [--prompt-file f] | --enable id | --disable id | --run id | --delete id --yes] | prs --project p [--state open] | pr --thread t [--number n] [--all] | pr --project p --repo o/r --number n | fork --thread t [--run runId] [--title x] [--owner subscriber] | stop --thread t | subtasks --thread t [--all] | subagent-stop --thread t --subagent id | resume-at-reset --thread t [--cancel] | snooze-until-reset --thread t [--cancel] | watch --thread a[,b] [--state file] [--stall-min 20] [--json] | new/send ... --attach img1.png,img2.jpg | new/send ... --prompt-file p.md | send ... --no-verify | skills [list] [--from dir] [--to dir] | skills install --to dir [--from dir] [--only a,b] [--dry-run] [--force]");
 };
-if (require.main !== module) module.exports = { skillHash, args, missingValue, pickThread, pickProject, outPath, sensitivePath, sensitiveName, SENSITIVE_NAME, isMainThread, limitLine, localT, tzName, isSettled, threadLine, decodeText, approvalAllowed, redirectText, deliveryOf, stallHint, watchSnap, watchDiff, pendingOf, requestInfo, parseWhen, parseEvery, buildAnswer, matchOption };
+if (require.main !== module) module.exports = { ownerOf, claimOwner, skillHash, args, missingValue, pickThread, pickProject, outPath, sensitivePath, sensitiveName, SENSITIVE_NAME, isMainThread, limitLine, localT, tzName, isSettled, threadLine, decodeText, approvalAllowed, redirectText, deliveryOf, stallHint, watchSnap, watchDiff, pendingOf, requestInfo, parseWhen, parseEvery, buildAnswer, matchOption };
 else main().catch((e) => { const m = String(e.message).match(/"message":"([^"]{3,300})"/); const msg = m && /^\[\{"_tag":"Fail"/.test(e.message) ? m[1] : e.message; console.error(/^[A-Z][A-Z0-9_]{3,}[: (]/.test(msg) ? msg : `error: ${msg}`); process.exit(1); });
